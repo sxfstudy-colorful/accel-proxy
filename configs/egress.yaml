@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Egress Node Configuration  (回源端)
+#
+# Topology:
+#   RelayNode ──► EgressNode (this) ──► Origin Server
+# ─────────────────────────────────────────────────────────────────────────────
+
+node:
+  type: egress
+  id: egress-node-01
+
+# Egress 节点不需要 services（路由信息由 HandshakeRequest 中的 target_host/port 决定）
+# 但可以配置用于 dial_timeout 覆盖
+services:
+  - id: web-service-a
+    port: 0
+    protocol: http
+    origin:
+      host: backend-a.internal
+      port: 80
+      dial_timeout: 10s
+
+  - id: db-service-b
+    port: 0
+    protocol: tcp
+    origin:
+      host: db.internal
+      port: 5432
+      dial_timeout: 5s
+
+  - id: api-service-c
+    port: 0
+    protocol: https
+    origin:
+      host: api.internal
+      port: 443
+      tls: true
+      dial_timeout: 10s
+
+# 内部隧道监听地址（接受来自 Relay 节点的 WS 连接）
+tunnel:
+  listen_addr: ":9100"
+  path: /tunnel
+  read_timeout: 60s
+  write_timeout: 60s
+  max_frame_size: 65536
+
+  tls:
+    enabled: false
+    cert_file: /etc/accel-proxy/certs/egress.crt
+    key_file:  /etc/accel-proxy/certs/egress.key
+
+log:
+  level: info
+  format: json

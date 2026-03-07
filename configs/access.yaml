@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Access Node Configuration
+#
+# Topology:
+#   Client ──► AccessNode (this) ──► RelayNode ──► EgressNode ──► Origin
+# ─────────────────────────────────────────────────────────────────────────────
+
+node:
+  type: access
+  id: access-node-01
+
+# 每个 service 对应一个接入端口，通过端口区分业务
+services:
+  # ── 业务 A：HTTP 加速（L7） ─────────────────────────────────────────────────
+  - id: web-service-a
+    port: 8080           # 客户端接入端口
+    protocol: http       # L7 HTTP 代理
+
+    origin:
+      host: backend-a.internal
+      port: 80
+      tls: false
+      dial_timeout: 10s
+
+    # 内部转发：通过 WebSocket 隧道发往中间 Relay 节点（支持多节点负载均衡）
+    next_hops:
+      - ws://relay-01.internal:9000/tunnel
+      - ws://relay-02.internal:9000/tunnel
+
+    http:
+      rewrite_host: true
+      add_request_headers:
+        X-Proxy-Service: "web-service-a"
+        X-Accel-Node:    "access-01"
+      remove_request_headers:
+        - Proxy-Authorization
+
+  # ── 业务 B：TCP 透明代理（L4） ─────────────────────────────────────────────
+  - id: db-service-b
+    port: 5432           # 客户端用这个端口访问数据库
+    protocol: tcp        # L4 透明代理
+
+    origin:
+      host: db.internal
+      port: 5432
+      tls: false
+      dial_timeout: 5s
+
+    next_hops:
+      - ws://relay-01.internal:9000/tunnel
+
+  # ── 业务 C：HTTPS 加速（L7 + TLS 卸载） ───────────────────────────────────
+  - id: api-service-c
+    port: 8443
+    protocol: https
+
+    origin:
+      host: api.internal
+      port: 443
+      tls: true
+      dial_timeout: 10s
+
+    next_hops:
+      - wss://relay-01.internal:9443/tunnel
+
+    http:
+      rewrite_host: true
+
+tunnel:
+  # Access 节点不需要 listen_addr（只作为 tunnel 客户端）
+  path: /tunnel
+  max_frame_size: 65536  # 64 KB
+
+log:
+  level: info
+  format: text
