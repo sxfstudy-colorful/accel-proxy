@@ -8,7 +8,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/accel-proxy/internal/config"
+	"github.com/sxfstudy-colorful/accel-proxy/internal/config"
 )
 
 // Dialer dials the next hop WebSocket tunnel endpoint.

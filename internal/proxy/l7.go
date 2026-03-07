@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/accel-proxy/internal/config"
+	"github.com/sxfstudy-colorful/accel-proxy/internal/config"
 )
 
 // L7Proxy is an HTTP/1.1 reverse proxy with header manipulation.
@@ -22,10 +22,10 @@ import (
 //   - CONNECT tunnelling (for HTTPS pass-through)
 //   - WebSocket upgrade pass-through
 type L7Proxy struct {
-	cfg     config.ServiceConfig
-	origin  *url.URL
-	rp      *httputil.ReverseProxy
-	logger  *slog.Logger
+	cfg       config.ServiceConfig
+	origin    *url.URL
+	rp        *httputil.ReverseProxy
+	logger    *slog.Logger
 	transport http.RoundTripper
 }
 
@@ -236,7 +236,7 @@ type bufPool struct{}
 
 func newBufPool() httputil.BufferPool { return &bufPool{} }
 func (b *bufPool) Get() []byte        { return make([]byte, 32*1024) }
-func (b *bufPool) Put([]byte)          {}
+func (b *bufPool) Put([]byte)         {}
 
 // ParseHTTPRequest reads an HTTP request from a raw connection
 // (used when the access node receives raw bytes and needs to inspect L7).
