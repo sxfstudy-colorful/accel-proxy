@@ -1,40 +1,65 @@
 package tunnel
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 const (
-	defaultFrameSize    = 32 * 1024 // 32 KB per WS binary frame
+	defaultFrameSize    = 32 * 1024
 	pingInterval        = 20 * time.Second
 	pongWait            = 30 * time.Second
 	writeDeadlineBuffer = 5 * time.Second
 )
 
-// Transport wraps a *websocket.Conn and exposes it as an io.ReadWriteCloser
-// so the proxy layer can treat the tunnel like a plain TCP connection.
+// errTransportDead is returned by Read/Write after the transport has been
+// permanently closed due to a write error or explicit Close().
+var ErrTransportDead = errors.New("transport is dead")
+
+// Transport wraps a *websocket.Conn and exposes it as an io.ReadWriteCloser.
 //
-// Internally it:
-//   - fragments large writes into bounded binary frames
-//   - answers pings to keep the connection alive through NAT/load-balancers
-//   - serialises concurrent writes (websocket.Conn is not goroutine-safe for writes)
+// # Duplicate-prevention guarantees
+//
+// Write:
+//   - Frames are written sequentially under writeMu; no two goroutines can
+//     interleave frames on the wire.
+//   - On the first write error the transport is immediately marked dead via
+//     an atomic flag.  All subsequent Write calls return errTransportDead
+//     without touching the connection, so no further data can be injected
+//     after a partial failure.
+//   - The caller (io.CopyBuffer) sees the error and stops reading from the
+//     source; the source never retries, so no bytes are sent twice.
+//
+// Read:
+//   - readPump is the SOLE consumer of incoming WebSocket frames. It writes
+//     them into an io.Pipe (unbuffered, no seek). Read() drains from the read
+//     end — each byte is consumed exactly once, never replayed.
+//   - On read error readPump closes the pipe write-end, causing the next
+//     Read() to return io.EOF, which terminates the relay goroutine cleanly.
 type Transport struct {
 	conn      *websocket.Conn
 	frameSize int64
 
-	// reader pipe: the read pump pushes reassembled payloads here
+	// reader pipe: readPump (sole writer) → Read() callers (sole reader)
 	pr *io.PipeReader
 	pw *io.PipeWriter
 
-	once   sync.Once
-	closed chan struct{}
-	writeMu sync.Mutex
+	closeOnce sync.Once
+	closed    chan struct{} // closed by markDead; unblocks pingPump
+	writeMu   sync.Mutex
+
+	// dead is set atomically to 1 on the first write error or Close().
+	// Write() checks this before attempting any frame send.
+	dead atomic.Int32
 
 	logger *slog.Logger
 }
@@ -53,40 +78,54 @@ func NewTransport(conn *websocket.Conn, frameSize int64, logger *slog.Logger) *T
 		closed:    make(chan struct{}),
 		logger:    logger,
 	}
-
-	// Configure keep-alive pong handler.
 	conn.SetReadLimit(frameSize + 512)
 	conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
-
 	go t.readPump()
 	go t.pingPump()
-
 	return t
 }
 
-// Read implements io.Reader. Blocks until data arrives from the remote side.
+// Read implements io.Reader.
+// Returns errTransportDead immediately if the transport has been permanently closed.
 func (t *Transport) Read(p []byte) (int, error) {
+	if t.dead.Load() == 1 {
+		return 0, ErrTransportDead
+	}
 	return t.pr.Read(p)
 }
 
-// Write implements io.Writer. Splits p into frames and sends them.
+// Write implements io.Writer.
+//
+// Atomicity guarantee: on the first write error the transport is marked dead
+// before returning. All subsequent Write calls return errTransportDead without
+// sending any data. This ensures no bytes can be re-sent after a partial failure.
 func (t *Transport) Write(p []byte) (int, error) {
+	if t.dead.Load() == 1 {
+		return 0, ErrTransportDead
+	}
+
 	total := 0
 	for len(p) > 0 {
 		n := int(t.frameSize)
 		if n > len(p) {
 			n = len(p)
 		}
+
 		t.writeMu.Lock()
 		t.conn.SetWriteDeadline(time.Now().Add(writeDeadlineBuffer + pingInterval))
 		err := t.conn.WriteMessage(websocket.BinaryMessage, p[:n])
 		t.writeMu.Unlock()
+
 		if err != nil {
-			return total, err
+			// Mark dead before returning so any concurrent goroutine that
+			// calls Write next sees the dead flag and bails immediately,
+			// rather than attempting to write to a broken connection.
+			t.markDead()
+			return total, fmt.Errorf("transport write: %w", err)
 		}
 		p = p[n:]
 		total += n
@@ -94,25 +133,39 @@ func (t *Transport) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-// Close shuts the transport down gracefully.
+// Close shuts the transport down gracefully. Idempotent.
 func (t *Transport) Close() error {
+	t.markDead() // mark dead first so concurrent writers exit via the dead check
 	var closeErr error
-	t.once.Do(func() {
-		close(t.closed)
+	t.closeOnce.Do(func() {
 		t.pw.Close()
 		t.writeMu.Lock()
 		t.conn.SetWriteDeadline(time.Now().Add(writeDeadlineBuffer))
-		t.conn.WriteMessage(
+		// Best-effort close frame: the peer should receive a clean close, but
+		// if this write fails the underlying conn.Close() below still tears
+		// down the TCP connection. We intentionally discard this error.
+		if err := t.conn.WriteMessage(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-		)
+		); err != nil {
+			t.logger.Debug("transport close frame write", "err", err)
+		}
 		t.writeMu.Unlock()
 		closeErr = t.conn.Close()
 	})
 	return closeErr
 }
 
+// markDead atomically marks the transport permanently unusable and
+// signals pingPump to exit. Safe to call concurrently many times.
+func (t *Transport) markDead() {
+	if t.dead.CompareAndSwap(0, 1) {
+		close(t.closed)
+	}
+}
+
 // readPump drains incoming binary frames into the pipe.
+// It is the SOLE reader of the WebSocket receive path.
 func (t *Transport) readPump() {
 	defer t.pw.Close()
 	for {
@@ -124,7 +177,7 @@ func (t *Transport) readPump() {
 			return
 		}
 		if mt != websocket.BinaryMessage {
-			continue // skip text/ping/pong frames
+			continue
 		}
 		if _, err := io.Copy(t.pw, r); err != nil {
 			t.logger.Debug("tunnel pipe write error", "err", err)
@@ -133,7 +186,8 @@ func (t *Transport) readPump() {
 	}
 }
 
-// pingPump sends periodic pings to keep the connection alive.
+// pingPump sends periodic pings to keep the connection alive through NAT/LB.
+// Exits when the transport is marked dead.
 func (t *Transport) pingPump() {
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
@@ -145,6 +199,7 @@ func (t *Transport) pingPump() {
 			err := t.conn.WriteMessage(websocket.PingMessage, nil)
 			t.writeMu.Unlock()
 			if err != nil {
+				t.markDead()
 				return
 			}
 		case <-t.closed:
@@ -153,21 +208,27 @@ func (t *Transport) pingPump() {
 	}
 }
 
-func isExpectedClose(err error) bool {
-	return websocket.IsCloseError(err,
-		websocket.CloseNormalClosure,
-		websocket.CloseGoingAway,
-		websocket.CloseNoStatusReceived,
-	)
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Relay helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Relay copies data between a net.Conn and a tunnel Transport concurrently,
-// closing both sides when either direction ends.
+// Relay copies data between a net.Conn and a Transport bidirectionally.
+//
+// Termination contract (prevents duplicate delivery):
+//   - goroutine A owns the read of conn; goroutine B owns the read of tun.
+//     No other goroutine reads either side. Each byte passes through exactly
+//     one Read call and one Write call.
+//   - When goroutine A finishes (EOF or error on conn), it calls tun.Close().
+//     tun.Close() marks the transport dead and closes the pipe, causing
+//     goroutine B's next Read from tun to return errTransportDead / io.EOF.
+//     Goroutine B then calls conn.Close() and exits.
+//   - The reverse path is symmetric.
+//   - Because tun.Close() marks the transport dead before the pipe is closed,
+//     no data written into tun after the close signal can reach the wire.
 func Relay(conn net.Conn, tun *Transport, logger *slog.Logger) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// conn → tunnel
 	go func() {
 		defer wg.Done()
 		defer tun.Close()
@@ -177,7 +238,6 @@ func Relay(conn net.Conn, tun *Transport, logger *slog.Logger) {
 		}
 	}()
 
-	// tunnel → conn
 	go func() {
 		defer wg.Done()
 		defer conn.Close()
@@ -190,7 +250,8 @@ func Relay(conn net.Conn, tun *Transport, logger *slog.Logger) {
 	wg.Wait()
 }
 
-// RelayTransports copies data between two tunnel Transports (relay node path).
+// RelayTransports copies data between two Transports (relay node path).
+// Same termination contract as Relay.
 func RelayTransports(a, b *Transport, logger *slog.Logger) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -199,25 +260,42 @@ func RelayTransports(a, b *Transport, logger *slog.Logger) {
 		defer wg.Done()
 		defer b.Close()
 		buf := make([]byte, 32*1024)
-		io.CopyBuffer(b, a, buf) //nolint:errcheck
+		if _, err := io.CopyBuffer(b, a, buf); err != nil && !isNetClosed(err) {
+			logger.Debug("relay transport a→b", "err", err)
+		}
 	}()
 
 	go func() {
 		defer wg.Done()
 		defer a.Close()
 		buf := make([]byte, 32*1024)
-		io.CopyBuffer(a, b, buf) //nolint:errcheck
+		if _, err := io.CopyBuffer(a, b, buf); err != nil && !isNetClosed(err) {
+			logger.Debug("relay transport b→a", "err", err)
+		}
 	}()
 
 	wg.Wait()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+func isExpectedClose(err error) bool {
+	return websocket.IsCloseError(err,
+		websocket.CloseNormalClosure,
+		websocket.CloseGoingAway,
+		websocket.CloseNoStatusReceived,
+	)
+}
+
 func isNetClosed(err error) bool {
-	if err == nil || err == io.EOF {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, ErrTransportDead) {
 		return true
 	}
-	if ne, ok := err.(*net.OpError); ok {
-		return ne.Err.Error() == "use of closed network connection"
+	var ne *net.OpError
+	if errors.As(err, &ne) {
+		return strings.Contains(ne.Err.Error(), "use of closed network connection")
 	}
 	return false
 }

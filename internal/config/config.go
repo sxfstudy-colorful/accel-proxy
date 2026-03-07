@@ -2,11 +2,117 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HopAddr — structured next-hop endpoint address
+//
+// Lives in config (not tunnel) to avoid a circular import:
+//   tunnel/server.go → config   (needs TunnelConfig)
+//   config           → HopAddr  (owns the type; no tunnel import needed)
+//   tunnel/hop_pool  → config   (uses config.HopAddr)
+//
+// Rationale for structured fields over a raw URL string:
+//
+//  1. IP/Port independence from DNS — edge relays often have only an IP;
+//     dialing works without any domain registration.
+//
+//  2. Explicit TLS SNI — when dialing by IP there is no hostname to derive
+//     SNI from. Host fills that role without conflating "where to connect"
+//     with "what name to present".
+//
+//  3. Clean hot-reload identity — identity is (IP, Port, TunnelPath).
+//     An IP rotation (container restart, DHCP) keeps health and latency
+//     history intact while updating only the address fields.
+//
+//  4. TCP-level probing — the prober dials IP:Port directly without
+//     parsing a URL.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// HopAddr is the address of one next-hop tunnel endpoint.
+//
+//   - IP:         dial target (IPv4/v6 literal). If empty, Host is used for dialing.
+//   - Port:       TCP port (required).
+//   - Host:       logical hostname for TLS SNI and HTTP Host header.
+//   - TLS:        use wss:// when true.
+//   - TunnelPath: WebSocket upgrade path; defaults to "/tunnel".
+type HopAddr struct {
+	IP         string `yaml:"ip"`
+	Port       int    `yaml:"port"`
+	Host       string `yaml:"host"`
+	TLS        bool   `yaml:"tls"`
+	TunnelPath string `yaml:"tunnel_path"`
+}
+
+// DialAddr returns the TCP address to connect to.
+// Uses IP:Port when IP is set; falls back to Host:Port for DNS-only configs.
+func (a HopAddr) DialAddr() string {
+	ip := a.IP
+	if ip == "" {
+		ip = a.Host
+	}
+	return net.JoinHostPort(ip, fmt.Sprintf("%d", a.Port))
+}
+
+// WsURL builds the WebSocket URL from the structured fields.
+// Constructed at dial time (not stored) so it always reflects current values.
+func (a HopAddr) WsURL() string {
+	scheme := "ws"
+	if a.TLS {
+		scheme = "wss"
+	}
+	path := a.TunnelPath
+	if path == "" {
+		path = "/tunnel"
+	}
+	host := a.Host
+	if host == "" {
+		host = a.IP
+	}
+	return fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(host, fmt.Sprintf("%d", a.Port)), path)
+}
+
+// Identity returns a stable string key for this endpoint: IP+Port+TunnelPath.
+// Host and TLS are excluded — they can change (cert rotation, SNI rename)
+// without changing which physical machine we are talking to.
+func (a HopAddr) Identity() string {
+	ip := a.IP
+	if ip == "" {
+		ip = a.Host
+	}
+	path := a.TunnelPath
+	if path == "" {
+		path = "/tunnel"
+	}
+	return fmt.Sprintf("%s:%d%s", ip, a.Port, path)
+}
+
+// Equal reports whether two HopAddrs are fully identical (all fields).
+func (a HopAddr) Equal(b HopAddr) bool {
+	return a.IP == b.IP &&
+		a.Port == b.Port &&
+		a.Host == b.Host &&
+		a.TLS == b.TLS &&
+		a.TunnelPath == b.TunnelPath
+}
+
+// EqualHopAddrs compares two HopAddr slices by full field equality.
+func EqualHopAddrs(a, b []HopAddr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !a[i].Equal(b[i]) {
+			return false
+		}
+	}
+	return true
+}
 
 // NodeType defines the role of this proxy node in the pipeline.
 //
@@ -14,111 +120,166 @@ import (
 type NodeType string
 
 const (
-	NodeTypeAccess NodeType = "access" // 接入端：面向客户端
-	NodeTypeRelay  NodeType = "relay"  // 中间代理节点：多跳转发
-	NodeTypeEgress NodeType = "egress" // 回源端：连接真实源站
+	NodeTypeAccess NodeType = "access"
+	NodeTypeRelay  NodeType = "relay"
+	NodeTypeEgress NodeType = "egress"
 )
 
 // Protocol is the business protocol on the client-facing side.
 type Protocol string
 
 const (
-	ProtocolTCP   Protocol = "tcp"   // L4 透明代理
-	ProtocolHTTP  Protocol = "http"  // L7 HTTP 代理
-	ProtocolHTTPS Protocol = "https" // L7 HTTPS 代理（TLS 卸载）
+	ProtocolTCP   Protocol = "tcp"
+	ProtocolHTTP  Protocol = "http"
+	ProtocolHTTPS Protocol = "https"
 )
 
-// Config is the root configuration structure.
+// ─────────────────────────────────────────────────────────────────────────────
+// Root config
+// ─────────────────────────────────────────────────────────────────────────────
+
 type Config struct {
-	Node     NodeConfig      `yaml:"node"`
-	Services []ServiceConfig `yaml:"services"` // only for access nodes
-	Tunnel   TunnelConfig    `yaml:"tunnel"`
-	Log      LogConfig       `yaml:"log"`
+	Node     NodeConfig     `yaml:"node"`
+	Services []ServiceConfig `yaml:"services"`
+	Tunnel   TunnelConfig   `yaml:"tunnel"`
+	Log      LogConfig      `yaml:"log"`
 }
 
 // NodeConfig identifies this node.
 type NodeConfig struct {
 	Type NodeType `yaml:"type"`
 	ID   string   `yaml:"id"`
+	// IDC is the datacenter this node physically lives in.
+	// Required for egress nodes (they serve the origin in this IDC).
+	// Optional for access/relay (they only route toward a target IDC).
+	IDC string `yaml:"idc"`
 }
 
-// ServiceConfig maps a listening port to a business service.
-// The access node uses this to determine where to route traffic.
+// ─────────────────────────────────────────────────────────────────────────────
+// ServiceConfig
+//
+// The meaning of fields differs by node type:
+//
+//  Access node
+//    - Port, Protocol  : client-facing listener
+//    - TargetIDC       : which datacenter the origin lives in
+//    - Routes          : idc → WebSocket URLs of next hop (relay/egress)
+//    - HTTP            : L7 header manipulation
+//
+//  Relay node
+//    - ID              : must match the ServiceID in HandshakeRequest
+//    - Routes          : idc → WebSocket URLs of next hop (relay/egress)
+//    (all other fields are ignored)
+//
+//  Egress node
+//    - ID              : must match the ServiceID in HandshakeRequest
+//    - Origin          : local origin address (in this IDC)
+//    (all other fields are ignored)
+// ─────────────────────────────────────────────────────────────────────────────
+
 type ServiceConfig struct {
-	ID       string       `yaml:"id"`
-	Port     int          `yaml:"port"`     // listening port that identifies this service
-	Protocol Protocol     `yaml:"protocol"` // tcp | http | https
-	Origin   OriginConfig `yaml:"origin"`   // final destination (used by egress)
+	ID       string   `yaml:"id"`
+	Port     int      `yaml:"port"`     // access only: client-facing listen port
+	Protocol Protocol `yaml:"protocol"` // access only: tcp | http | https
 
-	// NextHops lists WebSocket URLs of the next proxy layer.
-	// Multiple entries enable load-balanced or failover forwarding.
-	// Format: ws://host:port/tunnel  or  wss://host:port/tunnel
-	NextHops []string `yaml:"next_hops"`
+	// TargetIDC is the datacenter that holds the origin for this service.
+	// Set on access nodes; carried unchanged through the tunnel as the routing key.
+	TargetIDC string `yaml:"target_idc"`
 
-	// L7-specific settings (HTTP/HTTPS only)
+	// Routes maps a target IDC name to one or more next-hop endpoints.
+	// Used by access and relay nodes to forward toward the correct datacenter.
+	//
+	// Each endpoint is a structured address (IP, Port, Host, TLS, TunnelPath).
+	// Using structured fields instead of raw URLs allows:
+	//   - Dialing by IP with a separate TLS SNI hostname (edge nodes without DNS)
+	//   - Clean hot-reload: IP rotation preserves health/latency history
+	//   - TCP-level health probing without URL parsing
+	//
+	// Example:
+	//   routes:
+	//     idc-beijing:
+	//       - ip: 10.0.1.5
+	//         port: 9000
+	//         host: relay-bj-01.internal   # TLS SNI / HTTP Host
+	//         tls: false
+	//       - ip: 10.0.1.6
+	//         port: 9000
+	//         host: relay-bj-02.internal
+	Routes map[string][]HopAddr `yaml:"routes"`
+
+	// Origin is the real backend address.
+	// Only meaningful on egress nodes (local to their IDC).
+	Origin OriginConfig `yaml:"origin"`
+
+	// HTTP holds L7 header-manipulation settings (access nodes, http/https only).
 	HTTP HTTPConfig `yaml:"http"`
 }
 
-// OriginConfig describes the real backend server.
+// NextHopsForIDC returns the configured next-hop endpoints for the given target IDC.
+func (s *ServiceConfig) NextHopsForIDC(idc string) ([]HopAddr, bool) {
+	if s.Routes == nil {
+		return nil, false
+	}
+	hops, ok := s.Routes[idc]
+	return hops, ok && len(hops) > 0
+}
+
+// OriginConfig describes the real backend server (egress node only).
 type OriginConfig struct {
 	Host           string        `yaml:"host"`
 	Port           int           `yaml:"port"`
-	TLS            bool          `yaml:"tls"`             // connect to origin with TLS
-	DialTimeout    time.Duration `yaml:"dial_timeout"`    // default 10s
-	ConnectTimeout time.Duration `yaml:"connect_timeout"` // default 30s
+	TLS            bool          `yaml:"tls"`
+	DialTimeout    time.Duration `yaml:"dial_timeout"`
+	ConnectTimeout time.Duration `yaml:"connect_timeout"`
 }
 
-// HTTPConfig holds Layer-7 HTTP proxy settings.
+// HTTPConfig holds Layer-7 HTTP proxy settings (access nodes only).
 type HTTPConfig struct {
-	// Headers to add/override on forwarded requests.
-	AddRequestHeaders map[string]string `yaml:"add_request_headers"`
-	// Headers to strip from client requests before forwarding.
-	RemoveRequestHeaders []string `yaml:"remove_request_headers"`
-	// Whether to rewrite the Host header to the origin host.
-	RewriteHost bool `yaml:"rewrite_host"`
+	AddRequestHeaders    map[string]string `yaml:"add_request_headers"`
+	RemoveRequestHeaders []string          `yaml:"remove_request_headers"`
+	RewriteHost          bool              `yaml:"rewrite_host"`
 }
 
-// TunnelConfig configures the internal WebSocket tunnel endpoint.
-// Relay and Egress nodes listen on this address for incoming tunnels.
+// ─────────────────────────────────────────────────────────────────────────────
+// TunnelConfig — internal WebSocket tunnel listener (relay / egress nodes)
+// ─────────────────────────────────────────────────────────────────────────────
+
 type TunnelConfig struct {
-	ListenAddr string        `yaml:"listen_addr"` // e.g. ":9000"
-	Path       string        `yaml:"path"`        // WS path, default "/tunnel"
-	TLS        TLSConfig     `yaml:"tls"`
-	ReadTimeout  time.Duration `yaml:"read_timeout"`  // default 60s
-	WriteTimeout time.Duration `yaml:"write_timeout"` // default 60s
-	// Max size of a single WS frame in bytes (default 64KB)
-	MaxFrameSize int64 `yaml:"max_frame_size"`
+	ListenAddr   string        `yaml:"listen_addr"`
+	Path         string        `yaml:"path"`
+	TLS          TLSConfig     `yaml:"tls"`
+	ReadTimeout  time.Duration `yaml:"read_timeout"`
+	WriteTimeout time.Duration `yaml:"write_timeout"`
+	MaxFrameSize int64         `yaml:"max_frame_size"`
 }
 
-// TLSConfig holds TLS certificate paths for the tunnel listener.
 type TLSConfig struct {
 	Enabled  bool   `yaml:"enabled"`
 	CertFile string `yaml:"cert_file"`
 	KeyFile  string `yaml:"key_file"`
 }
 
-// LogConfig controls logging behaviour.
 type LogConfig struct {
-	Level  string `yaml:"level"`  // debug | info | warn | error
-	Format string `yaml:"format"` // text | json
+	Level  string `yaml:"level"`
+	Format string `yaml:"format"`
 }
 
-// Load reads and validates a config file.
+// ─────────────────────────────────────────────────────────────────────────────
+// Load + validate
+// ─────────────────────────────────────────────────────────────────────────────
+
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config %q: %w", path, err)
 	}
-
 	cfg := defaultConfig()
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
-
 	return cfg, nil
 }
 
@@ -130,10 +291,7 @@ func defaultConfig() *Config {
 			WriteTimeout: 60 * time.Second,
 			MaxFrameSize: 64 * 1024,
 		},
-		Log: LogConfig{
-			Level:  "info",
-			Format: "text",
-		},
+		Log: LogConfig{Level: "info", Format: "text"},
 	}
 }
 
@@ -147,9 +305,6 @@ func (c *Config) validate() error {
 
 	switch c.Node.Type {
 	case NodeTypeAccess:
-		if len(c.Services) == 0 {
-			return fmt.Errorf("access node requires at least one service")
-		}
 		ports := make(map[int]bool)
 		for i, svc := range c.Services {
 			if svc.Port == 0 {
@@ -159,8 +314,11 @@ func (c *Config) validate() error {
 				return fmt.Errorf("duplicate service port %d", svc.Port)
 			}
 			ports[svc.Port] = true
-			if len(svc.NextHops) == 0 {
-				return fmt.Errorf("service %q has no next_hops", svc.ID)
+			if svc.TargetIDC == "" {
+				return fmt.Errorf("service %q: target_idc is required on access node", svc.ID)
+			}
+			if _, ok := svc.NextHopsForIDC(svc.TargetIDC); !ok {
+				return fmt.Errorf("service %q: routes has no entry for target_idc %q", svc.ID, svc.TargetIDC)
 			}
 		}
 
@@ -168,10 +326,26 @@ func (c *Config) validate() error {
 		if c.Tunnel.ListenAddr == "" {
 			return fmt.Errorf("relay node requires tunnel.listen_addr")
 		}
+		for i, svc := range c.Services {
+			if len(svc.Routes) == 0 {
+				return fmt.Errorf("relay service[%d] %q has no routes", i, svc.ID)
+			}
+		}
 
 	case NodeTypeEgress:
 		if c.Tunnel.ListenAddr == "" {
 			return fmt.Errorf("egress node requires tunnel.listen_addr")
+		}
+		if c.Node.IDC == "" {
+			return fmt.Errorf("egress node requires node.idc")
+		}
+		for i, svc := range c.Services {
+			if svc.Origin.Host == "" {
+				return fmt.Errorf("egress service[%d] %q: origin.host is required", i, svc.ID)
+			}
+			if svc.Origin.Port == 0 {
+				return fmt.Errorf("egress service[%d] %q: origin.port is required", i, svc.ID)
+			}
 		}
 
 	default:
@@ -181,10 +355,24 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// ServiceByPort returns the ServiceConfig for the given listening port.
+// ─────────────────────────────────────────────────────────────────────────────
+// Lookup helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ServiceByPort returns the ServiceConfig for the given listening port (access node).
 func (c *Config) ServiceByPort(port int) (*ServiceConfig, bool) {
 	for i := range c.Services {
 		if c.Services[i].Port == port {
+			return &c.Services[i], true
+		}
+	}
+	return nil, false
+}
+
+// ServiceByID returns the ServiceConfig for the given service ID.
+func (c *Config) ServiceByID(id string) (*ServiceConfig, bool) {
+	for i := range c.Services {
+		if c.Services[i].ID == id {
 			return &c.Services[i], true
 		}
 	}

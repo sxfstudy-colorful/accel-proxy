@@ -2,10 +2,12 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -68,12 +70,15 @@ func relay(a, b net.Conn, logger *slog.Logger) {
 }
 
 func isClosedErr(err error) bool {
-	if err == nil || err == io.EOF {
+	if err == nil || errors.Is(err, io.EOF) {
 		return true
 	}
-	if ne, ok := err.(*net.OpError); ok {
-		_ = ne
-		return true
+	var ne *net.OpError
+	if errors.As(err, &ne) {
+		s := ne.Err.Error()
+		return strings.Contains(s, "use of closed network connection") ||
+			strings.Contains(s, "connection reset by peer") ||
+			strings.Contains(s, "broken pipe")
 	}
 	return false
 }

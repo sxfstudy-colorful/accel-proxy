@@ -14,8 +14,6 @@ import (
 	"github.com/sxfstudy-colorful/accel-proxy/internal/config"
 )
 
-const tunnelDialTimeout = 10 * time.Second
-
 // certPollInterval is how often the background goroutine checks whether
 // the cert/key files on disk have changed.
 const certPollInterval = 30 * time.Second
@@ -45,8 +43,8 @@ func NewServer(cfg *config.TunnelConfig, nodeID string, handler ConnHandler, log
 	}
 
 	s := &Server{
-		cfg:     cfg,
-		nodeID:  nodeID,
+		cfg:    cfg,
+		nodeID: nodeID,
 		handler: handler,
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 10 * time.Second,
@@ -153,7 +151,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	req, err := ReceiveHandshake(conn)
 	if err != nil {
 		s.logger.Warn("handshake failed", "remote", r.RemoteAddr, "err", err)
-		SendResponse(conn, ErrResponse(s.nodeID, err.Error())) //nolint:errcheck
+		if sendErr := SendResponse(conn, ErrResponse(s.nodeID, err.Error())); sendErr != nil {
+			s.logger.Debug("send error response failed", "remote", r.RemoteAddr, "err", sendErr)
+		}
 		conn.Close()
 		return
 	}
@@ -167,7 +167,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("tunnel accepted",
 		"remote", r.RemoteAddr,
 		"service", req.ServiceID,
-		"target", fmt.Sprintf("%s:%d", req.TargetHost, req.TargetPort),
+		"target_idc", req.TargetIDC,
 		"client_ip", req.ClientIP,
 		"hops", req.HopCount,
 	)
@@ -178,5 +178,9 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok")) //nolint:errcheck
+	if _, err := w.Write([]byte("ok")); err != nil {
+		// ResponseWriter write errors are non-actionable (client already gone);
+		// the http.Server framework handles connection cleanup.
+		_ = err
+	}
 }

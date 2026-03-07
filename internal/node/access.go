@@ -1,4 +1,3 @@
-// Package node implements the three proxy node types.
 package node
 
 import (
@@ -7,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sxfstudy-colorful/accel-proxy/internal/config"
 	"github.com/sxfstudy-colorful/accel-proxy/internal/proxy"
@@ -14,48 +14,66 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AccessNode
+// AccessNode  (边缘机房，面向客户端)
 //
-// Listens on N ports (one per service). When a client connects:
-//  1. Identifies the service by the port number.
-//  2. Dials the next-hop WebSocket tunnel.
-//  3. Sends a HandshakeRequest carrying routing metadata.
-//  4. Bridges the client TCP connection ↔ tunnel Transport.
+// 职责：按监听端口识别业务，建立到下一跳的隧道，L4/L7 分发。
+//
+// 热重载：
+//   Routes（next_hops）通过 atomic.Pointer 热更新，Dialer 随之替换。
+//   已建立的连接不受影响；新连接立即使用新路由。
+//   监听端口和协议类型不支持热更新（需重启）。
 // ─────────────────────────────────────────────────────────────────────────────
+
+// accessServiceState holds the hot-reloadable state for one service.
+type accessServiceState struct {
+	dialer    *tunnel.Dialer
+	targetIDC string
+}
 
 // AccessNode is the client-facing edge of the proxy pipeline.
 type AccessNode struct {
-	cfg       *config.Config
-	dialers   map[int]*tunnel.Dialer // port → dialer
-	l7proxies map[int]*proxy.L7Proxy // port → L7 proxy (http services)
+	cfg *config.Config
+
+	// states: port → atomic pointer to service state (hot-reloadable)
+	states     map[int]*atomic.Pointer[accessServiceState]
+	l7handlers map[int]*proxy.HTTPConnHandler // port → L7 handler (immutable)
+
 	listeners []net.Listener
 	logger    *slog.Logger
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 }
 
+var _ Node = (*AccessNode)(nil)
+
 // NewAccessNode constructs an AccessNode from the given config.
 func NewAccessNode(cfg *config.Config, logger *slog.Logger) (*AccessNode, error) {
 	n := &AccessNode{
-		cfg:       cfg,
-		dialers:   make(map[int]*tunnel.Dialer),
-		l7proxies: make(map[int]*proxy.L7Proxy),
-		logger:    logger,
+		cfg:        cfg,
+		states:     make(map[int]*atomic.Pointer[accessServiceState]),
+		l7handlers: make(map[int]*proxy.HTTPConnHandler),
+		logger:     logger,
 	}
 
 	for i := range cfg.Services {
 		svc := &cfg.Services[i]
 
-		n.dialers[svc.Port] = tunnel.NewDialerFromService(
-			svc, cfg.Tunnel.MaxFrameSize, logger,
-		)
+		hops, ok := svc.NextHopsForIDC(svc.TargetIDC)
+		if !ok {
+			return nil, fmt.Errorf(
+				"service %q: no routes for target_idc %q", svc.ID, svc.TargetIDC)
+		}
+
+		state := &accessServiceState{
+			dialer:    tunnel.NewDialer(tunnel.NewHopPool(hops, nil, logger), cfg.Tunnel.MaxFrameSize, logger),
+			targetIDC: svc.TargetIDC,
+		}
+		ptr := &atomic.Pointer[accessServiceState]{}
+		ptr.Store(state)
+		n.states[svc.Port] = ptr
 
 		if svc.Protocol == config.ProtocolHTTP || svc.Protocol == config.ProtocolHTTPS {
-			lp, err := proxy.NewL7Proxy(*svc, logger)
-			if err != nil {
-				return nil, fmt.Errorf("init L7 proxy for port %d: %w", svc.Port, err)
-			}
-			n.l7proxies[svc.Port] = lp
+			n.l7handlers[svc.Port] = proxy.NewHTTPConnHandler(*svc, logger)
 		}
 	}
 
@@ -81,7 +99,7 @@ func (n *AccessNode) Start() error {
 			"port", svc.Port,
 			"service", svc.ID,
 			"protocol", svc.Protocol,
-			"next_hops", svc.NextHops,
+			"target_idc", svc.TargetIDC,
 		)
 
 		n.wg.Add(1)
@@ -91,7 +109,7 @@ func (n *AccessNode) Start() error {
 	return nil
 }
 
-// Stop shuts down all listeners.
+// Stop closes all listeners and waits for in-flight connections to finish.
 func (n *AccessNode) Stop() {
 	if n.cancel != nil {
 		n.cancel()
@@ -102,9 +120,40 @@ func (n *AccessNode) Stop() {
 	n.wg.Wait()
 }
 
+// Reload applies updated routes without dropping existing connections.
+func (n *AccessNode) Reload(rc ReloadableConfig) error {
+	if len(rc.Routes) == 0 {
+		return nil
+	}
+
+	for i := range n.cfg.Services {
+		svc := &n.cfg.Services[i]
+		idcMap, ok := rc.Routes[svc.ID]
+		if !ok {
+			continue
+		}
+		hops, ok := idcMap[svc.TargetIDC]
+		if !ok || len(hops) == 0 {
+			n.logger.Warn("access reload: no hops for service, keeping old routes",
+				"service", svc.ID, "target_idc", svc.TargetIDC)
+			continue
+		}
+
+		newState := &accessServiceState{
+			dialer:    tunnel.NewDialer(tunnel.NewHopPool(hops, nil, n.logger), n.cfg.Tunnel.MaxFrameSize, n.logger),
+			targetIDC: svc.TargetIDC,
+		}
+		if ptr, ok := n.states[svc.Port]; ok {
+			ptr.Store(newState)
+			n.logger.Info("access: routes hot-reloaded",
+				"service", svc.ID, "target_idc", svc.TargetIDC, "hops", len(hops))
+		}
+	}
+	return nil
+}
+
 func (n *AccessNode) acceptLoop(ctx context.Context, ln net.Listener, svc *config.ServiceConfig) {
 	defer n.wg.Done()
-
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -119,44 +168,51 @@ func (n *AccessNode) acceptLoop(ctx context.Context, ln net.Listener, svc *confi
 		n.wg.Add(1)
 		go func() {
 			defer n.wg.Done()
-			n.handleConn(ctx, conn, svc)
+			n.handleConn(conn, svc)
 		}()
 	}
 }
 
-func (n *AccessNode) handleConn(ctx context.Context, conn net.Conn, svc *config.ServiceConfig) {
+func (n *AccessNode) handleConn(conn net.Conn, svc *config.ServiceConfig) {
 	defer conn.Close()
 
 	clientAddr, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+
+	// Snapshot the current state for this connection.
+	// A concurrent Reload() may swap the pointer, but this connection
+	// uses the state it observed at accept time for its full lifetime.
+	state := n.states[svc.Port].Load()
 
 	n.logger.Info("new connection",
 		"service", svc.ID,
 		"client", conn.RemoteAddr(),
 		"protocol", svc.Protocol,
+		"target_idc", state.targetIDC,
 	)
 
-	// Build the handshake that travels through all hops.
 	req := &tunnel.HandshakeRequest{
-		Version:    tunnel.Version,
-		ServiceID:  svc.ID,
-		TargetHost: svc.Origin.Host,
-		TargetPort: svc.Origin.Port,
-		Protocol:   string(svc.Protocol),
-		ClientIP:   clientAddr,
-		HopCount:   0,
+		Version:   tunnel.Version,
+		ServiceID: svc.ID,
+		TargetIDC: state.targetIDC,
+		Protocol:  string(svc.Protocol),
+		ClientIP:  clientAddr,
+		HopCount:  0,
 	}
 
-	dialer := n.dialers[svc.Port]
-	tun, err := dialer.DialWithFallback(req)
+	tun, err := state.dialer.DialWithFallback(req)
 	if err != nil {
-		n.logger.Error("tunnel dial failed", "service", svc.ID, "err", err)
+		n.logger.Error("tunnel dial failed",
+			"service", svc.ID, "target_idc", state.targetIDC, "err", err)
 		return
 	}
 
-	// Bridge client ↔ tunnel.
-	n.logger.Debug("tunnel established, relaying",
-		"service", svc.ID,
-		"client", conn.RemoteAddr(),
-	)
-	tunnel.Relay(conn, tun, n.logger)
+	n.logger.Debug("tunnel established",
+		"service", svc.ID, "target_idc", state.targetIDC)
+
+	switch svc.Protocol {
+	case config.ProtocolHTTP, config.ProtocolHTTPS:
+		n.l7handlers[svc.Port].Handle(conn, tun)
+	default:
+		tunnel.Relay(conn, tun, n.logger)
+	}
 }

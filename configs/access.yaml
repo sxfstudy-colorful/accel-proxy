@@ -1,75 +1,62 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# Access Node Configuration
-#
-# Topology:
-#   Client ──► AccessNode (this) ──► RelayNode ──► EgressNode ──► Origin
-# ─────────────────────────────────────────────────────────────────────────────
-
 node:
   type: access
-  id: access-node-01
+  id: access-shanghai-01
 
-# 每个 service 对应一个接入端口，通过端口区分业务
 services:
-  # ── 业务 A：HTTP 加速（L7） ─────────────────────────────────────────────────
+  # ── 业务 A：HTTP，源站在北京机房 ──────────────────────────────────────────
   - id: web-service-a
-    port: 8080           # 客户端接入端口
-    protocol: http       # L7 HTTP 代理
+    port: 8080
+    protocol: http
+    target_idc: idc-beijing
 
-    origin:
-      host: backend-a.internal
-      port: 80
-      tls: false
-      dial_timeout: 10s
-
-    # 内部转发：通过 WebSocket 隧道发往中间 Relay 节点（支持多节点负载均衡）
-    next_hops:
-      - ws://relay-01.internal:9000/tunnel
-      - ws://relay-02.internal:9000/tunnel
+    routes:
+      idc-beijing:
+        # 有固定域名的节点（标准配置）
+        - host: relay-bj-01.internal
+          port: 9000
+          tls: false
+        # 无域名的边缘节点，直接用 IP 拨连，host 仅用于 TLS SNI / 日志
+        - ip: 10.0.1.6
+          port: 9000
+          host: relay-bj-02.internal  # TLS SNI；无 TLS 时仅用于日志
+          tls: false
 
     http:
       rewrite_host: true
       add_request_headers:
         X-Proxy-Service: "web-service-a"
-        X-Accel-Node:    "access-01"
-      remove_request_headers:
-        - Proxy-Authorization
 
-  # ── 业务 B：TCP 透明代理（L4） ─────────────────────────────────────────────
+  # ── 业务 B：TCP，源站在北京机房 ──────────────────────────────────────────
   - id: db-service-b
-    port: 5432           # 客户端用这个端口访问数据库
-    protocol: tcp        # L4 透明代理
+    port: 5432
+    protocol: tcp
+    target_idc: idc-beijing
+    routes:
+      idc-beijing:
+        - ip: 10.0.1.5
+          port: 9000
+          host: relay-bj-01.internal
 
-    origin:
-      host: db.internal
-      port: 5432
-      tls: false
-      dial_timeout: 5s
-
-    next_hops:
-      - ws://relay-01.internal:9000/tunnel
-
-  # ── 业务 C：HTTPS 加速（L7 + TLS 卸载） ───────────────────────────────────
+  # ── 业务 C：HTTPS，源站在香港机房 ──────────────────────────────────────
   - id: api-service-c
     port: 8443
     protocol: https
-
-    origin:
-      host: api.internal
-      port: 443
-      tls: true
-      dial_timeout: 10s
-
-    next_hops:
-      - wss://relay-01.internal:9443/tunnel
-
-    http:
-      rewrite_host: true
+    target_idc: idc-hongkong
+    routes:
+      idc-hongkong:
+        - ip: 10.0.2.10
+          port: 9000
+          host: relay-hk-01.internal
+          tls: true
+          tunnel_path: /tunnel
+        - ip: 10.0.2.11
+          port: 9000
+          host: relay-hk-02.internal
+          tls: true
 
 tunnel:
-  # Access 节点不需要 listen_addr（只作为 tunnel 客户端）
   path: /tunnel
-  max_frame_size: 65536  # 64 KB
+  max_frame_size: 65536
 
 log:
   level: info
