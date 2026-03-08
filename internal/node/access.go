@@ -58,10 +58,10 @@ func NewAccessNode(cfg *config.Config, logger *slog.Logger) (*AccessNode, error)
 	for i := range cfg.Services {
 		svc := &cfg.Services[i]
 
-		hops, ok := svc.NextHopsForIDC(svc.TargetIDC)
-		if !ok {
+		hops := svc.SortedHops()
+		if len(hops) == 0 {
 			return nil, fmt.Errorf(
-				"service %q: no routes for target_idc %q", svc.ID, svc.TargetIDC)
+				"service %q: no hops configured", svc.ID)
 		}
 
 		state := &accessServiceState{
@@ -120,30 +120,22 @@ func (n *AccessNode) Stop() {
 	n.wg.Wait()
 }
 
-// Reload applies updated routes without dropping existing connections.
+// Reload applies updated route groups without dropping existing connections.
 func (n *AccessNode) Reload(rc ReloadableConfig) error {
-	if len(rc.Routes) == 0 {
+	if len(rc.Groups) == 0 {
 		return nil
 	}
 
 	for i := range n.cfg.Services {
 		svc := &n.cfg.Services[i]
-		idcRoutes, ok := rc.Routes[svc.ID]
+		groups, ok := rc.Groups[svc.ID]
 		if !ok {
 			continue
 		}
-		// Find the IDCRoute entry for this service's target IDC and extract
-		// priority-sorted hops the same way the relay node does.
-		var hops []config.HopAddr
-		for j := range idcRoutes {
-			if idcRoutes[j].IDC == svc.TargetIDC {
-				hops = idcRoutes[j].SortedHops()
-				break
-			}
-		}
+		hops := config.SortGroups(groups)
 		if len(hops) == 0 {
 			n.logger.Warn("access reload: no hops for service, keeping old routes",
-				"service", svc.ID, "target_idc", svc.TargetIDC)
+				"service", svc.ID)
 			continue
 		}
 
@@ -154,7 +146,7 @@ func (n *AccessNode) Reload(rc ReloadableConfig) error {
 		if ptr, ok := n.states[svc.Port]; ok {
 			ptr.Store(newState)
 			n.logger.Info("access: routes hot-reloaded",
-				"service", svc.ID, "target_idc", svc.TargetIDC, "hops", len(hops))
+				"service", svc.ID, "hops", len(hops))
 		}
 	}
 	return nil

@@ -47,15 +47,19 @@ type CertReloader interface {
 //   - Service.Port                  — rebinding a port requires restart
 //   - Service.Protocol              — L4/L7 mode switch requires restart
 type ReloadableConfig struct {
-	// Routes is the updated IDC routing table for relay/access nodes.
-	// Key: serviceID → updated []IDCRoute (replaces existing routes for that service).
+	// Groups is the updated route groups for access nodes.
+	// Key: serviceID → updated []RouteGroup (replaces existing groups).
+	Groups map[string][]config.RouteGroup
+
+	// Routes is the updated IDC routing table for relay nodes.
+	// Key: serviceID → updated []IDCRoute.
 	Routes map[string][]config.IDCRoute
 
 	// Origins is the updated origin address mapping for egress nodes.
-	// Key: serviceID, Value: updated OriginConfig.
+	// Key: serviceID → updated OriginConfig.
 	Origins map[string]OriginUpdate
 
-	// Log allows changing the log level at runtime.
+	// LogLevel allows changing the log level at runtime.
 	LogLevel string
 }
 

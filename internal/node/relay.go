@@ -120,7 +120,7 @@ func (n *RelayNode) handleTunnel(req *tunnel.HandshakeRequest, inbound *tunnel.T
 		session.Logger().Warn("relay: unknown service")
 		return
 	}
-	nextHops := hopsForIDC(idcRoutes, req.TargetIDC)
+	nextHops := config.HopsForIDC(idcRoutes, req.TargetIDC)
 	if len(nextHops) == 0 {
 		session.Logger().Warn("relay: no route for target IDC")
 		return
@@ -196,12 +196,5 @@ func buildRouteTable(cfg *config.Config) (routeTable, error) {
 	return tbl, nil
 }
 
-// hopsForIDC returns priority-sorted hops for the given IDC from an IDCRoute slice.
-func hopsForIDC(routes []config.IDCRoute, idc string) []config.HopAddr {
-	for i := range routes {
-		if routes[i].IDC == idc {
-			return routes[i].SortedHops()
-		}
-	}
-	return nil
-}
+
+

@@ -4,7 +4,7 @@ node:
 
 services:
   - id: web-service-a
-    routes:
+    routes:                      # relay 需要 idc 键区分多个目标机房
       - idc: idc-beijing
         groups:
           - name: primary
@@ -21,6 +21,12 @@ services:
               - ip: 10.1.0.9
                 port: 9100
                 host: egress-bj-backup.internal
+      - idc: idc-hongkong
+        groups:
+          - hops:
+              - ip: 10.2.0.1
+                port: 9100
+                host: egress-hk-01.internal
 
   - id: db-service-b
     routes:

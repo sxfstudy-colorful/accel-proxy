@@ -6,23 +6,21 @@ services:
   - id: web-service-a
     port: 8080
     protocol: http
-    target_idc: idc-beijing
-    routes:
-      - idc: idc-beijing
-        groups:
-          - name: primary
-            hops:
-              - host: relay-bj-01.internal
-                port: 9000
-              - ip: 10.0.1.6
-                port: 9000
-                host: relay-bj-02.internal
-          - name: backup
-            priority: -1          # 仅在 primary 全部失联时使用
-            hops:
-              - ip: 10.0.1.9
-                port: 9000
-                host: relay-bj-backup.internal
+    target_idc: idc-beijing      # 路由目标 IDC，groups 无需重复声明
+    groups:
+      - name: primary
+        hops:
+          - host: relay-bj-01.internal
+            port: 9000
+          - ip: 10.0.1.6
+            port: 9000
+            host: relay-bj-02.internal
+      - name: backup
+        priority: -1             # 仅在 primary 全部失联时使用
+        hops:
+          - ip: 10.0.1.9
+            port: 9000
+            host: relay-bj-backup.internal
     http:
       rewrite_host: true
       add_request_headers:
@@ -32,13 +30,11 @@ services:
     port: 5432
     protocol: tcp
     target_idc: idc-beijing
-    routes:
-      - idc: idc-beijing
-        groups:
-          - hops:
-              - ip: 10.0.1.5
-                port: 9000
-                host: relay-bj-01.internal
+    groups:
+      - hops:
+          - ip: 10.0.1.5
+            port: 9000
+            host: relay-bj-01.internal
 
 tunnel:
   path: /tunnel

@@ -119,13 +119,17 @@ func handleReload(n node.Node, configFile string, liveCfg **config.Config, logge
 // buildReloadableConfig extracts the hot-reloadable subset of a config.
 func buildReloadableConfig(cfg *config.Config) node.ReloadableConfig {
 	rc := node.ReloadableConfig{
+		Groups:   make(map[string][]config.RouteGroup),
 		Routes:   make(map[string][]config.IDCRoute),
 		Origins:  make(map[string]node.OriginUpdate),
 		LogLevel: cfg.Log.Level,
 	}
 	for _, svc := range cfg.Services {
+		if len(svc.Groups) > 0 {
+			rc.Groups[svc.ID] = svc.Groups // access nodes
+		}
 		if len(svc.Routes) > 0 {
-			rc.Routes[svc.ID] = svc.Routes
+			rc.Routes[svc.ID] = svc.Routes // relay nodes
 		}
 		if svc.Origin.Host != "" {
 			rc.Origins[svc.ID] = node.OriginUpdate{
