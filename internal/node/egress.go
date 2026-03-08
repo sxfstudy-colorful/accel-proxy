@@ -42,13 +42,12 @@ type originTable map[string]*originEntry
 // EgressNode terminates tunnels and connects to real origin servers.
 type EgressNode struct {
 	baseNode
-	cfg     *config.Config
-	origins atomic.Pointer[originTable]
-	// reloadMu serialises concurrent Reload() calls.
+	cfg      *config.Config
+	origins  atomic.Pointer[originTable]
 	reloadMu sync.Mutex
 }
 
-var _ Node = (*EgressNode)(nil)
+var _ Node         = (*EgressNode)(nil)
 var _ CertReloader = (*EgressNode)(nil)
 
 // NewEgressNode constructs an EgressNode.
@@ -80,7 +79,6 @@ func (n *EgressNode) Stop() { n.stopServer() }
 func (n *EgressNode) ReloadCert() error { return n.reloadCert() }
 
 // Reload applies updated origin addresses without dropping connections.
-// In-flight sessions keep using the old entry; new sessions use the new one.
 func (n *EgressNode) Reload(rc ReloadableConfig) error {
 	if len(rc.Origins) == 0 {
 		return nil
@@ -113,16 +111,14 @@ func (n *EgressNode) Reload(rc ReloadableConfig) error {
 }
 
 // handleTunnel is called for each accepted inbound tunnel.
-func (n *EgressNode) handleTunnel(req *tunnel.HandshakeRequest, tun *tunnel.Transport) {
-	defer tun.Close()
+func (n *EgressNode) handleTunnel(req *tunnel.HandshakeRequest, inbound *tunnel.Transport) {
+	session := tunnel.NewTunnelSession(req, inbound, n.logger)
+	defer session.Close()
 
 	// ── 1. IDC 校验 ────────────────────────────────────────────────────────
 	if req.TargetIDC != n.cfg.Node.IDC {
-		n.logger.Error("egress: target IDC mismatch — routing error",
-			"want", n.cfg.Node.IDC,
-			"got", req.TargetIDC,
-			"service", req.ServiceID,
-		)
+		session.Logger().Error("egress: target IDC mismatch — routing error",
+			"want", n.cfg.Node.IDC, "got", req.TargetIDC)
 		return
 	}
 
@@ -130,7 +126,7 @@ func (n *EgressNode) handleTunnel(req *tunnel.HandshakeRequest, tun *tunnel.Tran
 	origins := *n.origins.Load()
 	entry, ok := origins[req.ServiceID]
 	if !ok {
-		n.logger.Error("egress: unknown service", "service_id", req.ServiceID)
+		session.Logger().Error("egress: unknown service")
 		return
 	}
 
@@ -139,24 +135,13 @@ func (n *EgressNode) handleTunnel(req *tunnel.HandshakeRequest, tun *tunnel.Tran
 	// ── 3. 拨连源站 ────────────────────────────────────────────────────────
 	origin, err := dialOrigin(entry.addr(), useTLS, entry.dialTimeout)
 	if err != nil {
-		n.logger.Error("egress: dial origin failed",
-			"service", req.ServiceID,
-			"origin", entry.addr(),
-			"err", err,
-		)
+		session.Logger().Error("egress: dial origin failed",
+			"origin", entry.addr(), "err", err)
 		return
 	}
-	defer origin.Close()
 
-	n.logger.Info("egress: origin connected",
-		"service", req.ServiceID,
-		"origin", entry.addr(),
-		"client_ip", req.ClientIP,
-		"hops", req.HopCount,
-	)
-
-	// ── 4. 桥接 tunnel ↔ origin ────────────────────────────────────────────
-	tunnel.Relay(origin, tun, n.logger)
+	// ── 4. 桥接 tunnel ↔ origin (blocks until both sides close) ────────────
+	session.RunOrigin(origin)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,3 +182,4 @@ func dialOrigin(addr string, useTLS bool, timeout time.Duration) (net.Conn, erro
 	}
 	return conn, nil
 }
+

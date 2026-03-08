@@ -128,12 +128,20 @@ func (n *AccessNode) Reload(rc ReloadableConfig) error {
 
 	for i := range n.cfg.Services {
 		svc := &n.cfg.Services[i]
-		idcMap, ok := rc.Routes[svc.ID]
+		idcRoutes, ok := rc.Routes[svc.ID]
 		if !ok {
 			continue
 		}
-		hops, ok := idcMap[svc.TargetIDC]
-		if !ok || len(hops) == 0 {
+		// Find the IDCRoute entry for this service's target IDC and extract
+		// priority-sorted hops the same way the relay node does.
+		var hops []config.HopAddr
+		for j := range idcRoutes {
+			if idcRoutes[j].IDC == svc.TargetIDC {
+				hops = idcRoutes[j].SortedHops()
+				break
+			}
+		}
+		if len(hops) == 0 {
 			n.logger.Warn("access reload: no hops for service, keeping old routes",
 				"service", svc.ID, "target_idc", svc.TargetIDC)
 			continue

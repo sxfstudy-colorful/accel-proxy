@@ -119,7 +119,7 @@ func handleReload(n node.Node, configFile string, liveCfg **config.Config, logge
 // buildReloadableConfig extracts the hot-reloadable subset of a config.
 func buildReloadableConfig(cfg *config.Config) node.ReloadableConfig {
 	rc := node.ReloadableConfig{
-		Routes:   make(map[string]map[string][]config.HopAddr),
+		Routes:   make(map[string][]config.IDCRoute),
 		Origins:  make(map[string]node.OriginUpdate),
 		LogLevel: cfg.Log.Level,
 	}

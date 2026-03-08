@@ -5,28 +5,31 @@ node:
 services:
   - id: web-service-a
     routes:
-      idc-beijing:
-        - ip: 10.1.0.1          # 直接 IP，不依赖 DNS
-          port: 9100
-          host: egress-bj-01.internal
-        - ip: 10.1.0.2
-          port: 9100
-          host: egress-bj-02.internal
+      - idc: idc-beijing
+        groups:
+          - name: primary
+            hops:
+              - ip: 10.1.0.1
+                port: 9100
+                host: egress-bj-01.internal
+              - ip: 10.1.0.2
+                port: 9100
+                host: egress-bj-02.internal
+          - name: backup
+            priority: -1
+            hops:
+              - ip: 10.1.0.9
+                port: 9100
+                host: egress-bj-backup.internal
 
   - id: db-service-b
     routes:
-      idc-beijing:
-        - ip: 10.1.0.1
-          port: 9100
-          host: egress-bj-01.internal
-
-  - id: api-service-c
-    routes:
-      idc-hongkong:
-        - ip: 10.2.0.1
-          port: 9000
-          host: relay-hk-01.internal
-          tls: true
+      - idc: idc-beijing
+        groups:
+          - hops:
+              - ip: 10.1.0.1
+                port: 9100
+                host: egress-bj-01.internal
 
 tunnel:
   listen_addr: ":9000"

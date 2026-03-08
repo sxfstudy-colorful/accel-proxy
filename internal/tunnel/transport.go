@@ -21,8 +21,9 @@ const (
 	writeDeadlineBuffer = 5 * time.Second
 )
 
-// errTransportDead is returned by Read/Write after the transport has been
-// permanently closed due to a write error or explicit Close().
+// ErrTransportDead is returned by Read and Write after a Transport has been
+// permanently closed due to a write error or an explicit Close() call.
+// Callers outside the tunnel package can use errors.Is to detect this condition.
 var ErrTransportDead = errors.New("transport is dead")
 
 // Transport wraps a *websocket.Conn and exposes it as an io.ReadWriteCloser.
@@ -33,7 +34,7 @@ var ErrTransportDead = errors.New("transport is dead")
 //   - Frames are written sequentially under writeMu; no two goroutines can
 //     interleave frames on the wire.
 //   - On the first write error the transport is immediately marked dead via
-//     an atomic flag.  All subsequent Write calls return errTransportDead
+//     an atomic flag.  All subsequent Write calls return ErrTransportDead
 //     without touching the connection, so no further data can be injected
 //     after a partial failure.
 //   - The caller (io.CopyBuffer) sees the error and stops reading from the
@@ -90,7 +91,7 @@ func NewTransport(conn *websocket.Conn, frameSize int64, logger *slog.Logger) *T
 }
 
 // Read implements io.Reader.
-// Returns errTransportDead immediately if the transport has been permanently closed.
+// Returns ErrTransportDead immediately if the transport has been permanently closed.
 func (t *Transport) Read(p []byte) (int, error) {
 	if t.dead.Load() == 1 {
 		return 0, ErrTransportDead
@@ -101,7 +102,7 @@ func (t *Transport) Read(p []byte) (int, error) {
 // Write implements io.Writer.
 //
 // Atomicity guarantee: on the first write error the transport is marked dead
-// before returning. All subsequent Write calls return errTransportDead without
+// before returning. All subsequent Write calls return ErrTransportDead without
 // sending any data. This ensures no bytes can be re-sent after a partial failure.
 func (t *Transport) Write(p []byte) (int, error) {
 	if t.dead.Load() == 1 {
@@ -220,7 +221,7 @@ func (t *Transport) pingPump() {
 //     one Read call and one Write call.
 //   - When goroutine A finishes (EOF or error on conn), it calls tun.Close().
 //     tun.Close() marks the transport dead and closes the pipe, causing
-//     goroutine B's next Read from tun to return errTransportDead / io.EOF.
+//     goroutine B's next Read from tun to return ErrTransportDead / io.EOF.
 //     Goroutine B then calls conn.Close() and exits.
 //   - The reverse path is symmetric.
 //   - Because tun.Close() marks the transport dead before the pipe is closed,

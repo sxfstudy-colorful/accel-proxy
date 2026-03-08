@@ -186,26 +186,30 @@ type ServiceConfig struct {
 	// Set on access nodes; carried unchanged through the tunnel as the routing key.
 	TargetIDC string `yaml:"target_idc"`
 
-	// Routes maps a target IDC name to one or more next-hop endpoints.
+	// Routes is the ordered list of IDC-level routing entries for this service.
 	// Used by access and relay nodes to forward toward the correct datacenter.
 	//
-	// Each endpoint is a structured address (IP, Port, Host, TLS, TunnelPath).
-	// Using structured fields instead of raw URLs allows:
-	//   - Dialing by IP with a separate TLS SNI hostname (edge nodes without DNS)
-	//   - Clean hot-reload: IP rotation preserves health/latency history
-	//   - TCP-level health probing without URL parsing
+	// Hierarchy: Service → IDCRoute → RouteGroup → HopAddr
 	//
-	// Example:
 	//   routes:
-	//     idc-beijing:
-	//       - ip: 10.0.1.5
-	//         port: 9000
-	//         host: relay-bj-01.internal   # TLS SNI / HTTP Host
-	//         tls: false
-	//       - ip: 10.0.1.6
-	//         port: 9000
-	//         host: relay-bj-02.internal
-	Routes map[string][]HopAddr `yaml:"routes"`
+	//     - idc: idc-beijing
+	//       groups:
+	//         - name: primary       # optional; defaults to "default"
+	//           hops:
+	//             - ip: 10.0.1.5
+	//               port: 9000
+	//               host: relay-bj-01.internal
+	//         - name: backup
+	//           priority: -1        # lower priority = tried after primary groups
+	//           hops:
+	//             - ip: 10.0.1.6
+	//               port: 9000
+	//     - idc: idc-shanghai
+	//       groups:
+	//         - hops:
+	//             - ip: 10.0.2.1
+	//               port: 9000
+	Routes []IDCRoute `yaml:"routes"`
 
 	// Origin is the real backend address.
 	// Only meaningful on egress nodes (local to their IDC).
@@ -215,13 +219,114 @@ type ServiceConfig struct {
 	HTTP HTTPConfig `yaml:"http"`
 }
 
-// NextHopsForIDC returns the configured next-hop endpoints for the given target IDC.
+// ─────────────────────────────────────────────────────────────────────────────
+// Route hierarchy types
+// ─────────────────────────────────────────────────────────────────────────────
+
+// IDCRoute is the routing entry for one target datacenter.
+// A ServiceConfig holds one IDCRoute per reachable IDC.
+type IDCRoute struct {
+	// IDC is the datacenter identifier this entry routes toward.
+	IDC string `yaml:"idc"`
+
+	// Groups is the ordered list of route groups within this IDC.
+	// Groups are tried in descending Priority order (highest first).
+	// Within a group, hops are distributed across the group's HopPool
+	// according to the configured selector (default: round-robin).
+	//
+	// At least one group with at least one hop is required.
+	Groups []RouteGroup `yaml:"groups"`
+}
+
+// RouteGroup is a named, weighted set of HopAddrs within one IDC.
+//
+// Use multiple groups per IDC to model primary/backup topology:
+//
+//	groups:
+//	  - name: primary    # priority 0 (default) — tried first
+//	    hops: [...]
+//	  - name: backup
+//	    priority: -1     # lower → tried only when primary group is exhausted
+//	    hops: [...]
+//
+// Weight is reserved for future weighted-random selection between groups
+// of equal priority.
+type RouteGroup struct {
+	// Name is an optional human-readable label used in logs and metrics.
+	// Defaults to "default" if empty.
+	Name string `yaml:"name"`
+
+	// Priority controls the order in which groups are tried.
+	// Higher value = tried first. Groups with equal priority are tried
+	// in declaration order. Default: 0.
+	Priority int `yaml:"priority"`
+
+	// Weight is reserved for future weighted selection between same-priority
+	// groups. Currently unused; all same-priority groups are treated equally.
+	Weight int `yaml:"weight"`
+
+	// Hops is the list of individual next-hop endpoints in this group.
+	Hops []HopAddr `yaml:"hops"`
+}
+
+// GroupName returns the display name of the group (never empty).
+func (g *RouteGroup) GroupName() string {
+	if g.Name == "" {
+		return "default"
+	}
+	return g.Name
+}
+
+// AllHops returns all HopAddrs across all groups in declaration order,
+// without priority sorting. Used for simple flat lookups.
+func (r *IDCRoute) AllHops() []HopAddr {
+	var out []HopAddr
+	for i := range r.Groups {
+		out = append(out, r.Groups[i].Hops...)
+	}
+	return out
+}
+
+// NextHopsForIDC finds the IDCRoute for the given IDC and returns its hops
+// ordered by group priority (highest first), then declaration order within
+// each priority tier.
 func (s *ServiceConfig) NextHopsForIDC(idc string) ([]HopAddr, bool) {
-	if s.Routes == nil {
+	route := s.IDCRouteFor(idc)
+	if route == nil {
 		return nil, false
 	}
-	hops, ok := s.Routes[idc]
-	return hops, ok && len(hops) > 0
+	hops := route.SortedHops()
+	return hops, len(hops) > 0
+}
+
+// IDCRouteFor returns the IDCRoute for the given IDC, or nil if not found.
+func (s *ServiceConfig) IDCRouteFor(idc string) *IDCRoute {
+	for i := range s.Routes {
+		if s.Routes[i].IDC == idc {
+			return &s.Routes[i]
+		}
+	}
+	return nil
+}
+
+// SortedHops returns all hops ordered by group priority descending.
+// Groups with higher Priority values are placed first.
+// Within the same priority tier, declaration order is preserved.
+func (r *IDCRoute) SortedHops() []HopAddr {
+	// Stable sort groups by descending priority.
+	// N is tiny (typically 1–3 groups), so insertion sort is fine.
+	sorted := make([]RouteGroup, len(r.Groups))
+	copy(sorted, r.Groups)
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j].Priority > sorted[j-1].Priority; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	var out []HopAddr
+	for i := range sorted {
+		out = append(out, sorted[i].Hops...)
+	}
+	return out
 }
 
 // OriginConfig describes the real backend server (egress node only).
@@ -329,6 +434,19 @@ func (c *Config) validate() error {
 		for i, svc := range c.Services {
 			if len(svc.Routes) == 0 {
 				return fmt.Errorf("relay service[%d] %q has no routes", i, svc.ID)
+			}
+			for j, r := range svc.Routes {
+				if r.IDC == "" {
+					return fmt.Errorf("relay service %q routes[%d]: idc is required", svc.ID, j)
+				}
+				if len(r.Groups) == 0 {
+					return fmt.Errorf("relay service %q routes[%d] (idc=%s): at least one group required", svc.ID, j, r.IDC)
+				}
+				for k, g := range r.Groups {
+					if len(g.Hops) == 0 {
+						return fmt.Errorf("relay service %q routes[%d].groups[%d] (%s): at least one hop required", svc.ID, j, k, g.GroupName())
+					}
+				}
 			}
 		}
 

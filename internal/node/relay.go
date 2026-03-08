@@ -15,16 +15,16 @@ import (
 //
 // 职责：接受入向隧道，按 TargetIDC 查路由表，转发到下一跳。
 //
+// 路由层级：Service → IDCRoute → RouteGroup → HopAddr
+//   routeTable[serviceID] → []config.IDCRoute
+//
 // 热重载：
-//   Routes（next_hops）可在不中断存量连接的情况下更新。
-//   实现方式：routeTable 字段通过 atomic.Pointer 持有，
-//   Reload() 构造新表后原子替换，handleTunnel 每次取引用时拿到的
-//   始终是完整的旧表或完整的新表，不存在中间状态。
+//   routeTable 通过 atomic.Pointer 持有，Reload() 原子替换。
+//   handleTunnel 在连接建立时快照一次，整条连接生命周期使用同一张表。
 // ─────────────────────────────────────────────────────────────────────────────
 
-// routeTable maps serviceID → IDC → []nextHopURL.
-// Treated as immutable once stored; hot-reload swaps the whole pointer.
-type routeTable map[string]map[string][]config.HopAddr
+// routeTable maps serviceID → []IDCRoute (immutable once stored).
+type routeTable map[string][]config.IDCRoute
 
 // RelayNode forwards tunnels toward the target IDC.
 type RelayNode struct {
@@ -32,27 +32,16 @@ type RelayNode struct {
 	cfg       *config.Config
 	frameSize int64
 
-	// routes is accessed via atomic pointer for lock-free hot-reload.
-	// Writers (Reload) swap the whole table; readers (handleTunnel) take
-	// a snapshot at the start of each connection — they see either the
-	// complete old table or the complete new table, never a partial update.
-	routes atomic.Pointer[routeTable]
-
-	// reloadMu serialises concurrent Reload() calls.
-	// The atomic.Pointer alone guarantees readers always see a consistent
-	// table, but the read-modify-write in Reload needs a mutex to prevent
-	// two concurrent reloads from overwriting each other's changes.
+	routes   atomic.Pointer[routeTable]
 	reloadMu sync.Mutex
 
-	// dialers caches per-(serviceID, IDC) Dialer instances so Round-Robin
-	// counters persist across connections. Keyed by dialerKey.
-	// Must be a field (not a package-level var) so multiple RelayNode
-	// instances in the same process don't share counters.
 	dialersMu sync.RWMutex
 	dialers   map[dialerKey]*tunnel.Dialer
 }
 
-var _ Node = (*RelayNode)(nil)
+type dialerKey struct{ serviceID, idc string }
+
+var _ Node         = (*RelayNode)(nil)
 var _ CertReloader = (*RelayNode)(nil)
 
 // NewRelayNode constructs a RelayNode.
@@ -89,27 +78,23 @@ func (n *RelayNode) Stop() { n.stopServer() }
 // ReloadCert triggers an immediate TLS certificate reload.
 func (n *RelayNode) ReloadCert() error { return n.reloadCert() }
 
-// Reload applies updated route configuration without dropping connections.
-// Existing in-flight sessions continue using the old route table until they
-// finish; new connections pick up the updated table immediately.
+// Reload applies updated routing configuration without dropping connections.
+// In-flight sessions keep their snapshot; new connections pick up the new table.
 func (n *RelayNode) Reload(rc ReloadableConfig) error {
 	if len(rc.Routes) == 0 {
 		return nil
 	}
 
-	// Serialise concurrent reloads. The atomic.Pointer guarantees readers
-	// always see a consistent table, but two concurrent Reload() calls doing
-	// read-modify-write would overwrite each other's changes without this mutex.
 	n.reloadMu.Lock()
 	defer n.reloadMu.Unlock()
 
 	current := *n.routes.Load()
 	next := make(routeTable, len(current))
-	for svcID, idcMap := range current {
-		next[svcID] = idcMap
+	for svcID, routes := range current {
+		next[svcID] = routes
 	}
-	for svcID, idcMap := range rc.Routes {
-		next[svcID] = idcMap
+	for svcID, routes := range rc.Routes {
+		next[svcID] = routes
 	}
 	n.routes.Store(&next)
 
@@ -118,28 +103,58 @@ func (n *RelayNode) Reload(rc ReloadableConfig) error {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-(service, IDC) Dialer cache
-//
-// Preserves Round-Robin counters across connections so load balancing works
-// correctly. Stored as a RelayNode field (not a package-level var) so that
-// multiple RelayNode instances in the same process don't share state.
-//
-// When Reload() changes next-hop URLs, dialerFor detects the content change
-// and replaces the Dialer, resetting the counter for that bucket only.
+// handleTunnel
 // ─────────────────────────────────────────────────────────────────────────────
 
-type dialerKey struct{ serviceID, idc string }
+// handleTunnel is called by tunnel.Server for each accepted inbound connection.
+func (n *RelayNode) handleTunnel(req *tunnel.HandshakeRequest, inbound *tunnel.Transport) {
+	session := tunnel.NewTunnelSession(req, inbound, n.logger)
+	defer session.Close()
+
+	// ── 1. Route lookup ───────────────────────────────────────────────────
+	// Snapshot the table once; this connection is immune to concurrent Reload().
+	routes := *n.routes.Load()
+
+	idcRoutes, ok := routes[req.ServiceID]
+	if !ok {
+		session.Logger().Warn("relay: unknown service")
+		return
+	}
+	nextHops := hopsForIDC(idcRoutes, req.TargetIDC)
+	if len(nextHops) == 0 {
+		session.Logger().Warn("relay: no route for target IDC")
+		return
+	}
+
+	// ── 2. Hop-count guard (loop detection) ───────────────────────────────
+	forwardReq := *req
+	forwardReq.HopCount++
+	if forwardReq.HopCount > tunnel.MaxHopCount {
+		session.Logger().Error("relay: hop count exceeded, dropping",
+			"max", tunnel.MaxHopCount)
+		return
+	}
+
+	// ── 3. Dial next hop ──────────────────────────────────────────────────
+	dialer := n.dialerFor(req.ServiceID, req.TargetIDC, nextHops)
+	outbound, err := dialer.DialWithFallback(&forwardReq)
+	if err != nil {
+		session.Logger().Error("relay: next-hop dial failed", "err", err)
+		return
+	}
+
+	// ── 4. Bridge tunnels (blocks until both sides close) ─────────────────
+	session.RunRelay(outbound)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-(service, IDC) Dialer cache
+// ─────────────────────────────────────────────────────────────────────────────
 
 // dialerFor returns a stable Dialer for the (serviceID, idc) pair.
-//
-// If the next-hop URLs are unchanged from the existing Dialer's pool, the
-// existing Dialer is reused — preserving the selector's Round-Robin counter
-// and each endpoint's alive flag + latency history.
-//
-// If the addresses have changed (after a Reload()), UpdateEndpoints is called
-// existing pool: unchanged endpoints keep their health/latency state; new
-// endpoints start fresh; removed endpoints are discarded.
-// A new Dialer wrapping the updated pool replaces the old one in the cache.
+// If the hop list is unchanged, the existing Dialer (with its Round-Robin
+// counter and endpoint health/latency) is reused. If changed, UpdateEndpoints
+// is called in-place so surviving endpoints keep their state.
 func (n *RelayNode) dialerFor(serviceID, idc string, nextHops []config.HopAddr) *tunnel.Dialer {
 	key := dialerKey{serviceID, idc}
 
@@ -147,69 +162,22 @@ func (n *RelayNode) dialerFor(serviceID, idc string, nextHops []config.HopAddr) 
 	d, ok := n.dialers[key]
 	n.dialersMu.RUnlock()
 	if ok && config.EqualHopAddrs(d.Pool().Addrs(), nextHops) {
-		return d // URLs unchanged: reuse pool (counter + health intact)
+		return d
 	}
 
 	n.dialersMu.Lock()
 	defer n.dialersMu.Unlock()
-	// Double-check under write lock.
 	if d, ok = n.dialers[key]; ok {
 		if config.EqualHopAddrs(d.Pool().Addrs(), nextHops) {
 			return d
 		}
-		// URLs changed: hot-update the existing pool in-place so endpoints
-		// that survive the change keep their alive flag and latency history.
 		d.Pool().UpdateEndpoints(nextHops)
 		return d
 	}
-	// No existing entry: create a new pool + dialer.
 	pool := tunnel.NewHopPool(nextHops, nil, n.logger)
 	d = tunnel.NewDialer(pool, n.frameSize, n.logger)
 	n.dialers[key] = d
 	return d
-}
-
-// handleTunnel is called for each accepted inbound tunnel.
-func (n *RelayNode) handleTunnel(req *tunnel.HandshakeRequest, inbound *tunnel.Transport) {
-	defer inbound.Close()
-
-	nextHops := *n.routes.Load()
-	nextServiceHop, ok := nextHops[req.ServiceID]
-	if !ok {
-		n.logger.Error("relay: unknown service", "service_id", req.ServiceID)
-		return
-	}
-
-	hopAddress, ok := nextServiceHop[req.TargetIDC]
-	if !ok {
-		n.logger.Error("relay: unknown target", "target", req.TargetIDC)
-		return
-	}
-
-	// Forward request with incremented hop count.
-	forwardReq := *req
-	forwardReq.HopCount++
-
-	hopPool := tunnel.NewHopPool(hopAddress, &tunnel.LatencySelector{}, n.logger)
-
-	dialer := tunnel.NewDialer(hopPool, n.cfg.Tunnel.MaxFrameSize, n.logger)
-	outbound, err := dialer.DialWithFallback(&forwardReq)
-	if err != nil {
-		n.logger.Error("relay: next-hop dial failed",
-			"service", req.ServiceID,
-			"err", err,
-		)
-		return
-	}
-
-	n.logger.Info("relay: bridging tunnels",
-		"service", req.ServiceID,
-		"client_ip", req.ClientIP,
-		"hop", forwardReq.HopCount,
-	)
-
-	// Bridge the two transports.
-	tunnel.RelayTransports(inbound, outbound, n.logger)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,4 +194,14 @@ func buildRouteTable(cfg *config.Config) (routeTable, error) {
 		tbl[svc.ID] = svc.Routes
 	}
 	return tbl, nil
+}
+
+// hopsForIDC returns priority-sorted hops for the given IDC from an IDCRoute slice.
+func hopsForIDC(routes []config.IDCRoute, idc string) []config.HopAddr {
+	for i := range routes {
+		if routes[i].IDC == idc {
+			return routes[i].SortedHops()
+		}
+	}
+	return nil
 }
