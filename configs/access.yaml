@@ -1,52 +1,37 @@
 node:
-  type: access
   id: access-shanghai-01
 
-services:
-  - id: web-service-a
-    port: 8080
-    protocol: http
-    target_idc: idc-beijing
-    groups:
-      - name: primary
-        hops:
-          - type: domain
-            addr: relay-bj-01.internal
-            port: 9000
-            tls: true
-          - type: ip
-            addr: 10.0.1.6
-            port: 9000
-            host: relay-bj-02.internal
-            tls: true
-      - name: backup
-        priority: -1
-        hops:
-          - type: ip
-            addr: 10.0.1.9
-            port: 9000
-            host: relay-bj-backup.internal
-            tls: true
-    http:
-      rewrite_host: true
-      add_request_headers:
-        X-Proxy-Service: "web-service-a"
-
-  - id: db-service-b
-    port: 5432
-    protocol: tcp
-    target_idc: idc-beijing
-    groups:
-      - hops:
-          - type: ip
-            addr: 10.0.1.5
-            port: 9000
-            host: relay-bj-01.internal
-            tls: false
-
-tunnel:
-  path: /tunnel
+access:
   max_frame_size: 65536
+  services:
+    - id: web-service-a
+      port: 8080
+      protocol: http
+      target_idc: idc-beijing
+      groups:
+        - name: primary
+          hops:
+            - type: domain
+              addr: relay-bj-01.internal
+              port: 9000
+              tls: true
+            - type: ip
+              addr: 10.0.1.6
+              port: 9000
+              host: relay-bj-02.internal
+              tls: true
+        - name: backup
+          priority: -1
+          hops:
+            - type: ip
+              addr: 10.0.1.9
+              port: 9000
+              host: relay-bj-backup.internal
+              tls: true
+      http:
+        rewrite_host: true
+        add_request_headers:
+          X-Proxy-Service: "web-service-a"
 
 log:
   level: info

@@ -132,6 +132,9 @@ func (s *Server) Stop(ctx context.Context) error {
 	return s.httpServer.Shutdown(ctx)
 }
 
+// ListenAddr returns the configured TCP listen address.
+func (s *Server) ListenAddr() string { return s.httpServer.Addr }
+
 // ReloadCert triggers an immediate certificate reload from disk.
 // Intended to be wired to a SIGHUP handler in main().
 func (s *Server) ReloadCert() error {

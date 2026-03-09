@@ -1,0 +1,39 @@
+# Combined: relay + egress in the same IDC process.
+# Useful for small IDC deployments where a single node receives tunnel traffic
+# and also connects directly to origin servers.
+node:
+  id: combined-beijing-01
+  idc: idc-beijing   # required because egress section is present
+
+relay:
+  tunnel:
+    listen_addr: ":9000"
+    tls:
+      enabled: true
+      cert_file: /etc/accel-proxy/tls/node.crt
+      key_file:  /etc/accel-proxy/tls/node.key
+  services:
+    - id: web-service-a
+      routes:
+        - idc: idc-beijing
+          groups:
+            - hops:
+                - type: domain
+                  addr: localhost   # loop back to egress on the same process
+                  port: 9100
+                  tls: false        # loopback, no TLS needed
+
+egress:
+  tunnel:
+    listen_addr: ":9100"
+    tls:
+      enabled: false   # only accepting from relay on localhost
+  services:
+    - id: web-service-a
+      origin:
+        host: backend-svc.internal
+        port: 80
+
+log:
+  level: info
+  format: json

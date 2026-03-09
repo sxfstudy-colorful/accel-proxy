@@ -47,8 +47,14 @@ type CertReloader interface {
 //   - Service.Port                  — rebinding a port requires restart
 //   - Service.Protocol              — L4/L7 mode switch requires restart
 type ReloadableConfig struct {
+	// AccessServices is the full updated service list for access nodes.
+	// Used to diff against running services: new entries are started,
+	// removed entries are stopped, existing entries have their Groups hot-reloaded.
+	// Immutable fields (port, protocol) are not changed at runtime.
+	AccessServices []config.ServiceConfig
+
 	// Groups is the updated route groups for access nodes.
-	// Key: serviceID → updated []RouteGroup (replaces existing groups).
+	// Key: serviceID → updated []RouteGroup.
 	Groups map[string][]config.RouteGroup
 
 	// Routes is the updated IDC routing table for relay nodes.

@@ -170,17 +170,6 @@ func EqualHopAddrs(a, b []HopAddr) bool {
 
 
 
-// NodeType defines the role of this proxy node in the pipeline.
-//
-//   Client ──► AccessNode ──► RelayNode(s) ──► EgressNode ──► Origin
-type NodeType string
-
-const (
-	NodeTypeAccess NodeType = "access"
-	NodeTypeRelay  NodeType = "relay"
-	NodeTypeEgress NodeType = "egress"
-)
-
 // Protocol is the business protocol on the client-facing side.
 type Protocol string
 
@@ -194,20 +183,43 @@ const (
 // Root config
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Config is the root configuration for a proxy process.
+// Each role section (access/relay/egress) is optional.
+// At least one section must be present; all present sections run concurrently.
 type Config struct {
-	Node     NodeConfig     `yaml:"node"`
-	Services []ServiceConfig `yaml:"services"`
-	Tunnel   TunnelConfig   `yaml:"tunnel"`
-	Log      LogConfig      `yaml:"log"`
+	Node   NodeConfig    `yaml:"node"`
+	Access *AccessConfig `yaml:"access"` // nil = access role not running
+	Relay  *RelayConfig  `yaml:"relay"`  // nil = relay role not running
+	Egress *EgressConfig `yaml:"egress"` // nil = egress role not running
+	Log    LogConfig     `yaml:"log"`
 }
 
-// NodeConfig identifies this node.
+// AccessConfig holds configuration for the access (client-facing) role.
+type AccessConfig struct {
+	// MaxFrameSize is the maximum WebSocket frame size for outbound tunnels.
+	// Defaults to 65536 if zero.
+	MaxFrameSize int64           `yaml:"max_frame_size"`
+	Services     []ServiceConfig `yaml:"services"`
+}
+
+// RelayConfig holds configuration for the relay (middle-hop) role.
+type RelayConfig struct {
+	Tunnel   TunnelConfig    `yaml:"tunnel"`
+	Services []ServiceConfig `yaml:"services"`
+}
+
+// EgressConfig holds configuration for the egress (origin-facing) role.
+type EgressConfig struct {
+	Tunnel   TunnelConfig    `yaml:"tunnel"`
+	Services []ServiceConfig `yaml:"services"`
+}
+
+// NodeConfig identifies this process instance.
+// It is shared by all roles running in the same process.
 type NodeConfig struct {
-	Type NodeType `yaml:"type"`
-	ID   string   `yaml:"id"`
-	// IDC is the datacenter this node physically lives in.
-	// Required for egress nodes (they serve the origin in this IDC).
-	// Optional for access/relay (they only route toward a target IDC).
+	ID  string `yaml:"id"`
+	// IDC is the datacenter this instance physically lives in.
+	// Required when an EgressConfig section is present.
 	IDC string `yaml:"idc"`
 }
 
@@ -447,128 +459,122 @@ func Load(path string) (*Config, error) {
 }
 
 func defaultConfig() *Config {
+	defaultTunnel := TunnelConfig{
+		Path:         "/tunnel",
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		MaxFrameSize: 64 * 1024,
+	}
 	return &Config{
-		Tunnel: TunnelConfig{
-			Path:         "/tunnel",
-			ReadTimeout:  60 * time.Second,
-			WriteTimeout: 60 * time.Second,
-			MaxFrameSize: 64 * 1024,
-		},
-		Log: LogConfig{Level: "info", Format: "text"},
+		Relay:  &RelayConfig{Tunnel: defaultTunnel},
+		Egress: &EgressConfig{Tunnel: defaultTunnel},
+		Log:    LogConfig{Level: "info", Format: "text"},
 	}
 }
 
 func (c *Config) validate() error {
-	if c.Node.Type == "" {
-		return fmt.Errorf("node.type is required")
-	}
 	if c.Node.ID == "" {
 		return fmt.Errorf("node.id is required")
 	}
-
-	switch c.Node.Type {
-	case NodeTypeAccess:
-		ports := make(map[int]bool)
-		for i, svc := range c.Services {
-			if svc.Port == 0 {
-				return fmt.Errorf("service[%d].port is required", i)
-			}
-			if ports[svc.Port] {
-				return fmt.Errorf("duplicate service port %d", svc.Port)
-			}
-			ports[svc.Port] = true
-			if svc.TargetIDC == "" {
-				return fmt.Errorf("service %q: target_idc is required on access node", svc.ID)
-			}
-			if len(svc.Groups) == 0 {
-				return fmt.Errorf("service %q: at least one group required", svc.ID)
-			}
-			for j, g := range svc.Groups {
-				if len(g.Hops) == 0 {
-					return fmt.Errorf("service %q groups[%d] (%s): at least one hop required", svc.ID, j, g.GroupName())
-				}
-				for k, h := range g.Hops {
-					if err := validateHop(h); err != nil {
-						return fmt.Errorf("service %q groups[%d].hops[%d]: %w", svc.ID, j, k, err)
-					}
-				}
-			}
-		}
-
-	case NodeTypeRelay:
-		if c.Tunnel.ListenAddr == "" {
-			return fmt.Errorf("relay node requires tunnel.listen_addr")
-		}
-		for i, svc := range c.Services {
-			if len(svc.Routes) == 0 {
-				return fmt.Errorf("relay service[%d] %q has no routes", i, svc.ID)
-			}
-			for j, r := range svc.Routes {
-				if r.IDC == "" {
-					return fmt.Errorf("relay service %q routes[%d]: idc is required", svc.ID, j)
-				}
-				if len(r.Groups) == 0 {
-					return fmt.Errorf("relay service %q routes[%d] (idc=%s): at least one group required", svc.ID, j, r.IDC)
-				}
-				for k, g := range r.Groups {
-					if len(g.Hops) == 0 {
-						return fmt.Errorf("relay service %q routes[%d].groups[%d] (%s): at least one hop required", svc.ID, j, k, g.GroupName())
-					}
-					for l, h := range g.Hops {
-						if err := validateHop(h); err != nil {
-							return fmt.Errorf("relay service %q routes[%d].groups[%d].hops[%d]: %w", svc.ID, j, k, l, err)
-						}
-					}
-				}
-			}
-		}
-
-	case NodeTypeEgress:
-		if c.Tunnel.ListenAddr == "" {
-			return fmt.Errorf("egress node requires tunnel.listen_addr")
-		}
-		if c.Node.IDC == "" {
-			return fmt.Errorf("egress node requires node.idc")
-		}
-		for i, svc := range c.Services {
-			if svc.Origin.Host == "" {
-				return fmt.Errorf("egress service[%d] %q: origin.host is required", i, svc.ID)
-			}
-			if svc.Origin.Port == 0 {
-				return fmt.Errorf("egress service[%d] %q: origin.port is required", i, svc.ID)
-			}
-		}
-
-	default:
-		return fmt.Errorf("unknown node type %q", c.Node.Type)
+	if c.Access == nil && c.Relay == nil && c.Egress == nil {
+		return fmt.Errorf("at least one role section (access/relay/egress) must be configured")
 	}
-
+	if c.Access != nil {
+		if err := c.validateAccess(c.Access); err != nil {
+			return fmt.Errorf("access: %w", err)
+		}
+	}
+	if c.Relay != nil {
+		if err := c.validateRelay(c.Relay); err != nil {
+			return fmt.Errorf("relay: %w", err)
+		}
+	}
+	if c.Egress != nil {
+		if err := c.validateEgress(c.Egress); err != nil {
+			return fmt.Errorf("egress: %w", err)
+		}
+	}
 	return nil
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Lookup helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ServiceByPort returns the ServiceConfig for the given listening port (access node).
-func (c *Config) ServiceByPort(port int) (*ServiceConfig, bool) {
-	for i := range c.Services {
-		if c.Services[i].Port == port {
-			return &c.Services[i], true
+func (c *Config) validateAccess(a *AccessConfig) error {
+	ports := make(map[int]bool)
+	for i, svc := range a.Services {
+		if svc.Port == 0 {
+			return fmt.Errorf("service[%d].port is required", i)
+		}
+		if ports[svc.Port] {
+			return fmt.Errorf("duplicate service port %d", svc.Port)
+		}
+		ports[svc.Port] = true
+		if svc.TargetIDC == "" {
+			return fmt.Errorf("service %q: target_idc is required", svc.ID)
+		}
+		if len(svc.Groups) == 0 {
+			return fmt.Errorf("service %q: at least one group required", svc.ID)
+		}
+		for j, g := range svc.Groups {
+			if len(g.Hops) == 0 {
+				return fmt.Errorf("service %q groups[%d] (%s): at least one hop required", svc.ID, j, g.GroupName())
+			}
+			for k, h := range g.Hops {
+				if err := validateHop(h); err != nil {
+					return fmt.Errorf("service %q groups[%d].hops[%d]: %w", svc.ID, j, k, err)
+				}
+			}
 		}
 	}
-	return nil, false
+	return nil
 }
 
-// ServiceByID returns the ServiceConfig for the given service ID.
-func (c *Config) ServiceByID(id string) (*ServiceConfig, bool) {
-	for i := range c.Services {
-		if c.Services[i].ID == id {
-			return &c.Services[i], true
+func (c *Config) validateRelay(r *RelayConfig) error {
+	if r.Tunnel.ListenAddr == "" {
+		return fmt.Errorf("tunnel.listen_addr is required")
+	}
+	for i, svc := range r.Services {
+		if len(svc.Routes) == 0 {
+			return fmt.Errorf("service[%d] %q has no routes", i, svc.ID)
+		}
+		for j, rt := range svc.Routes {
+			if rt.IDC == "" {
+				return fmt.Errorf("service %q routes[%d]: idc is required", svc.ID, j)
+			}
+			if len(rt.Groups) == 0 {
+				return fmt.Errorf("service %q routes[%d] (idc=%s): at least one group required", svc.ID, j, rt.IDC)
+			}
+			for k, g := range rt.Groups {
+				if len(g.Hops) == 0 {
+					return fmt.Errorf("service %q routes[%d].groups[%d] (%s): at least one hop required", svc.ID, j, k, g.GroupName())
+				}
+				for l, h := range g.Hops {
+					if err := validateHop(h); err != nil {
+						return fmt.Errorf("service %q routes[%d].groups[%d].hops[%d]: %w", svc.ID, j, k, l, err)
+					}
+				}
+			}
 		}
 	}
-	return nil, false
+	return nil
 }
+
+func (c *Config) validateEgress(e *EgressConfig) error {
+	if e.Tunnel.ListenAddr == "" {
+		return fmt.Errorf("tunnel.listen_addr is required")
+	}
+	if c.Node.IDC == "" {
+		return fmt.Errorf("node.idc is required when egress is configured")
+	}
+	for i, svc := range e.Services {
+		if svc.Origin.Host == "" {
+			return fmt.Errorf("service[%d] %q: origin.host is required", i, svc.ID)
+		}
+		if svc.Origin.Port == 0 {
+			return fmt.Errorf("service[%d] %q: origin.port is required", i, svc.ID)
+		}
+	}
+	return nil
+}
+
 
 // validateHop checks that a HopAddr is correctly formed for its declared type.
 //

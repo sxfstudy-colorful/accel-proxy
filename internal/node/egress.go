@@ -19,12 +19,10 @@ import (
 //
 // 职责：终结隧道，连接本机房源站。
 //
-// 热重载：
-//   originTable 通过 atomic.Pointer 持有，Reload() 原子替换。
-//   新连接立即使用新源站地址；已建立的连接不受影响。
+// 构造：只依赖 *config.EgressConfig、nodeID、nodeIDC，与其他角色完全解耦。
+// 热重载：originTable 通过 atomic.Pointer 持有，Reload() 原子替换。
 // ─────────────────────────────────────────────────────────────────────────────
 
-// originEntry holds the dialing parameters for one service's origin.
 type originEntry struct {
 	host        string
 	port        int
@@ -36,13 +34,14 @@ func (e *originEntry) addr() string {
 	return fmt.Sprintf("%s:%d", e.host, e.port)
 }
 
-// originTable maps serviceID → originEntry. Immutable once stored.
 type originTable map[string]*originEntry
 
 // EgressNode terminates tunnels and connects to real origin servers.
 type EgressNode struct {
 	baseNode
-	cfg      *config.Config
+	nodeID  string
+	nodeIDC string
+
 	origins  atomic.Pointer[originTable]
 	reloadMu sync.Mutex
 }
@@ -50,47 +49,43 @@ type EgressNode struct {
 var _ Node         = (*EgressNode)(nil)
 var _ CertReloader = (*EgressNode)(nil)
 
-// NewEgressNode constructs an EgressNode.
-func NewEgressNode(cfg *config.Config, logger *slog.Logger) *EgressNode {
+// NewEgressNode constructs an EgressNode from its dedicated role config.
+func NewEgressNode(nodeID, nodeIDC string, cfg *config.EgressConfig, logger *slog.Logger) *EgressNode {
 	n := &EgressNode{
 		baseNode: baseNode{logger: logger},
-		cfg:      cfg,
+		nodeID:   nodeID,
+		nodeIDC:  nodeIDC,
 	}
-	tbl := buildOriginTable(cfg)
+	tbl := buildOriginTable(cfg.Services)
 	n.origins.Store(&tbl)
-	n.server = tunnel.NewServer(&cfg.Tunnel, cfg.Node.ID, n.handleTunnel, logger)
+	n.server = tunnel.NewServer(&cfg.Tunnel, nodeID, n.handleTunnel, logger)
 	return n
 }
 
-// Start begins accepting inbound tunnel connections (non-blocking).
 func (n *EgressNode) Start() error {
 	n.logger.Info("egress node starting",
-		"id", n.cfg.Node.ID,
-		"idc", n.cfg.Node.IDC,
-		"addr", n.cfg.Tunnel.ListenAddr,
+		"id", n.nodeID,
+		"idc", n.nodeIDC,
+		"addr", n.server.ListenAddr(),
 	)
-	return n.startServer("egress:" + n.cfg.Node.ID)
+	return n.startServer("egress:" + n.nodeID)
 }
 
-// Stop shuts down the egress node gracefully.
 func (n *EgressNode) Stop() { n.stopServer() }
 
-// ReloadCert triggers an immediate TLS certificate reload.
 func (n *EgressNode) ReloadCert() error { return n.reloadCert() }
 
-// Reload applies updated origin addresses without dropping connections.
 func (n *EgressNode) Reload(rc ReloadableConfig) error {
 	if len(rc.Origins) == 0 {
 		return nil
 	}
-
 	n.reloadMu.Lock()
 	defer n.reloadMu.Unlock()
 
 	current := *n.origins.Load()
 	next := make(originTable, len(current))
-	for id, e := range current {
-		next[id] = e
+	for k, v := range current {
+		next[k] = v
 	}
 	for svcID, upd := range rc.Origins {
 		dt := upd.DialTimeout
@@ -98,31 +93,25 @@ func (n *EgressNode) Reload(rc ReloadableConfig) error {
 			dt = 10 * time.Second
 		}
 		next[svcID] = &originEntry{
-			host:        upd.Host,
-			port:        upd.Port,
-			useTLS:      upd.TLS,
-			dialTimeout: dt,
+			host: upd.Host, port: upd.Port,
+			useTLS: upd.TLS, dialTimeout: dt,
 		}
 	}
-
 	n.origins.Store(&next)
 	n.logger.Info("egress: origins hot-reloaded", "updated_services", len(rc.Origins))
 	return nil
 }
 
-// handleTunnel is called for each accepted inbound tunnel.
 func (n *EgressNode) handleTunnel(req *tunnel.HandshakeRequest, inbound *tunnel.Transport) {
 	session := tunnel.NewTunnelSession(req, inbound, n.logger)
 	defer session.Close()
 
-	// ── 1. IDC 校验 ────────────────────────────────────────────────────────
-	if req.TargetIDC != n.cfg.Node.IDC {
+	if req.TargetIDC != n.nodeIDC {
 		session.Logger().Error("egress: target IDC mismatch — routing error",
-			"want", n.cfg.Node.IDC, "got", req.TargetIDC)
+			"want", n.nodeIDC, "got", req.TargetIDC)
 		return
 	}
 
-	// ── 2. 查源站配置（快照，hot-reload 不影响本次连接）─────────────────────
 	origins := *n.origins.Load()
 	entry, ok := origins[req.ServiceID]
 	if !ok {
@@ -130,37 +119,25 @@ func (n *EgressNode) handleTunnel(req *tunnel.HandshakeRequest, inbound *tunnel.
 		return
 	}
 
-	useTLS := entry.useTLS || req.Protocol == "https"
-
-	// ── 3. 拨连源站 ────────────────────────────────────────────────────────
-	origin, err := dialOrigin(entry.addr(), useTLS, entry.dialTimeout)
+	origin, err := dialOrigin(entry.addr(), entry.useTLS || req.Protocol == "https", entry.dialTimeout)
 	if err != nil {
-		session.Logger().Error("egress: dial origin failed",
-			"origin", entry.addr(), "err", err)
+		session.Logger().Error("egress: dial origin failed", "origin", entry.addr(), "err", err)
 		return
 	}
-
-	// ── 4. 桥接 tunnel ↔ origin (blocks until both sides close) ────────────
 	session.RunOrigin(origin)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-func buildOriginTable(cfg *config.Config) originTable {
-	tbl := make(originTable, len(cfg.Services))
-	for i := range cfg.Services {
-		svc := &cfg.Services[i]
+func buildOriginTable(services []config.ServiceConfig) originTable {
+	tbl := make(originTable, len(services))
+	for i := range services {
+		svc := &services[i]
 		dt := svc.Origin.DialTimeout
 		if dt == 0 {
 			dt = 10 * time.Second
 		}
 		tbl[svc.ID] = &originEntry{
-			host:        svc.Origin.Host,
-			port:        svc.Origin.Port,
-			useTLS:      svc.Origin.TLS,
-			dialTimeout: dt,
+			host: svc.Origin.Host, port: svc.Origin.Port,
+			useTLS: svc.Origin.TLS, dialTimeout: dt,
 		}
 	}
 	return tbl
@@ -182,4 +159,3 @@ func dialOrigin(addr string, useTLS bool, timeout time.Duration) (net.Conn, erro
 	}
 	return conn, nil
 }
-
