@@ -211,7 +211,7 @@ func (p *HopPool) UpdateEndpoints(newAddrs []config.HopAddr) {
 			if !e.addr.Equal(a) {
 				e.updateAddr(a)
 				p.logger.Debug("hop addr updated",
-					"identity", a.Identity(), "host", a.Host, "tls", a.TLS)
+					"identity", a.Identity(), "sni", a.SNIHost(), "tls", a.TLS)
 			}
 			next[i] = e
 		} else {
@@ -237,13 +237,13 @@ func (p *HopPool) reportResult(e *HopEndpoint, success bool, latency time.Durati
 	addr := e.Addr()
 	if success {
 		if !e.alive.Load() {
-			p.logger.Info("hop recovered", "identity", addr.Identity(), "host", addr.Host)
+			p.logger.Info("hop recovered", "identity", addr.Identity(), "sni", addr.SNIHost())
 		}
 		e.alive.Store(true)
 		e.recordLatency(latency)
 	} else {
 		if e.alive.Load() {
-			p.logger.Warn("hop marked dead", "identity", addr.Identity(), "host", addr.Host)
+			p.logger.Warn("hop marked dead", "identity", addr.Identity(), "sni", addr.SNIHost())
 		}
 		e.alive.Store(false)
 	}
@@ -333,29 +333,46 @@ func hopPoolError(idc, serviceID string, n int) error {
 	return fmt.Errorf("all %d next-hop(s) unavailable for idc=%q service=%q", n, idc, serviceID)
 }
 
-// dialWebSocketAddr dials a WebSocket connection using addr.DialAddr() for TCP
-// and addr.WsURL() for the HTTP upgrade. This lets us connect to a bare IP
-// while presenting the correct Host header and TLS SNI.
+// dialWebSocketAddr establishes a WebSocket tunnel connection to addr.
+// Behaviour depends on addr.Type:
+//
+//   domain — addr.Addr is a resolvable hostname. Standard dialing: the OS
+//            resolver handles DNS. WsURL uses addr.Addr as both the dial
+//            target and TLS SNI. No NetDial override is needed.
+//
+//   ip     — addr.Addr is an IPv4/IPv6 literal. WsURL uses addr.SNIHost()
+//            (i.e. addr.Host) so TLS certificate validation uses the correct
+//            name. NetDial overrides the WS library's dialer to connect
+//            directly to the IP, bypassing any DNS lookup.
 func dialWebSocketAddr(addr config.HopAddr) (*websocket.Conn, error) {
-	dialAddr := addr.DialAddr()
 	wsURL := addr.WsURL()
-
-	d := websocket.Dialer{
-		HandshakeTimeout: tunnelDialTimeout,
-		// NetDial bypasses the WS library's DNS resolution so we connect to
-		// IP:Port directly even when wsURL contains a hostname.
-		NetDial: func(network, _ string) (net.Conn, error) {
-			return net.DialTimeout(network, dialAddr, tunnelDialTimeout)
-		},
-	}
-
 	headers := http.Header{
 		"User-Agent": []string{"accel-proxy-tunnel/1"},
 	}
-	if addr.Host != "" {
-		headers.Set("Host", addr.Host)
-	}
 
-	conn, _, err := d.Dial(wsURL, headers)
-	return conn, err
+	switch addr.Type {
+	case config.HopAddrTypeIP:
+		// IP-based hop: connect directly to the IP, but present SNIHost in
+		// TLS ClientHello and HTTP Host header so certificate validation works.
+		dialAddr := addr.DialAddr() // ip:port — no DNS needed
+		d := websocket.Dialer{
+			HandshakeTimeout: tunnelDialTimeout,
+			NetDial: func(network, _ string) (net.Conn, error) {
+				// Ignore the address the WS library derived from wsURL
+				// (which is SNIHost:port) and connect to the IP directly.
+				return net.DialTimeout(network, dialAddr, tunnelDialTimeout)
+			},
+		}
+		// HTTP Host header: WS library sets it from the URL, but be explicit.
+		headers.Set("Host", addr.SNIHost())
+		conn, _, err := d.Dial(wsURL, headers)
+		return conn, err
+
+	default: // HopAddrTypeDomain
+		// Domain-based hop: let the WS library resolve DNS normally.
+		// wsURL already contains the domain, so TLS SNI is set correctly.
+		d := websocket.Dialer{HandshakeTimeout: tunnelDialTimeout}
+		conn, _, err := d.Dial(wsURL, headers)
+		return conn, err
+	}
 }

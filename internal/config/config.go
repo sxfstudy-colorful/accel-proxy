@@ -34,33 +34,92 @@ import (
 //     parsing a URL.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// HopAddrType identifies whether a HopAddr targets a domain name or a bare IP.
+// The type determines how dialing and TLS SNI are handled:
+//
+//   - HopAddrTypeDomain: Addr is a resolvable domain name. The OS resolver
+//     handles DNS. Addr doubles as the TLS SNI; Host is not needed.
+//
+//   - HopAddrTypeIP: Addr is an IPv4 or IPv6 literal. DNS is bypassed entirely.
+//     When TLS is enabled, Host must be set to supply the SNI that the relay's
+//     certificate is issued for — the IP itself carries no name information.
+type HopAddrType string
+
+const (
+	// HopAddrTypeDomain connects via DNS resolution.
+	// Addr must be a hostname; Host should be left empty.
+	HopAddrTypeDomain HopAddrType = "domain"
+
+	// HopAddrTypeIP connects directly to a bare IP address.
+	// Addr must be an IPv4/IPv6 literal; Host is required for TLS.
+	HopAddrTypeIP HopAddrType = "ip"
+)
+
 // HopAddr is the address of one next-hop tunnel endpoint.
 //
-//   - IP:         dial target (IPv4/v6 literal). If empty, Host is used for dialing.
-//   - Port:       TCP port (required).
-//   - Host:       logical hostname for TLS SNI and HTTP Host header.
-//   - TLS:        use wss:// when true.
-//   - TunnelPath: WebSocket upgrade path; defaults to "/tunnel".
+// The Type field selects between two dialing modes:
+//
+//	# Domain-based relay (DNS resolves the address):
+//	type: domain
+//	addr: relay-bj-01.internal   # DNS name; also used as TLS SNI
+//	port: 9000
+//	tls:  true
+//	# host: omit — domain is already the correct SNI
+//
+//	# IP-based edge relay (no DNS registration, TLS still required):
+//	type: ip
+//	addr: 10.0.1.6               # dialed directly, bypasses DNS
+//	port: 9000
+//	host: relay-bj-02.internal   # TLS SNI — must match the relay certificate
+//	tls:  true
+//
+// Fields:
+//
+//	Type       — required. "domain" or "ip".
+//	Addr       — required. Domain name (type=domain) or IP literal (type=ip).
+//	Port       — required. TCP port.
+//	Host       — TLS SNI / HTTP Host override. Required when type=ip and tls=true.
+//	             Ignored when type=domain (Addr is already the correct name).
+//	TLS        — use wss:// (WebSocket over TLS).
+//	TunnelPath — WebSocket upgrade path; defaults to "/tunnel".
 type HopAddr struct {
-	IP         string `yaml:"ip"`
-	Port       int    `yaml:"port"`
-	Host       string `yaml:"host"`
-	TLS        bool   `yaml:"tls"`
-	TunnelPath string `yaml:"tunnel_path"`
+	Type       HopAddrType `yaml:"type"`
+	Addr       string      `yaml:"addr"`
+	Port       int         `yaml:"port"`
+	Host       string      `yaml:"host"`        // SNI; required for ip+tls, ignored for domain
+	TLS        bool        `yaml:"tls"`
+	TunnelPath string      `yaml:"tunnel_path"`
 }
 
 // DialAddr returns the TCP address to connect to.
-// Uses IP:Port when IP is set; falls back to Host:Port for DNS-only configs.
+//
+//   - domain: Addr:Port — the OS resolver handles DNS at dial time.
+//   - ip:     Addr:Port — connects directly to the IP, no DNS query.
 func (a HopAddr) DialAddr() string {
-	ip := a.IP
-	if ip == "" {
-		ip = a.Host
-	}
-	return net.JoinHostPort(ip, fmt.Sprintf("%d", a.Port))
+	return net.JoinHostPort(a.Addr, fmt.Sprintf("%d", a.Port))
 }
 
-// WsURL builds the WebSocket URL from the structured fields.
-// Constructed at dial time (not stored) so it always reflects current values.
+// SNIHost returns the hostname to present in TLS ClientHello and HTTP Host header.
+//
+//   - domain: returns Addr — the domain name is its own SNI.
+//   - ip:     returns Host — IP literals cannot carry certificate names; the
+//             operator must explicitly supply the relay's hostname via Host.
+//
+// Returns an empty string only for a misconfigured ip-type hop with no Host.
+// Callers should treat an empty SNIHost with TLS enabled as a configuration error.
+func (a HopAddr) SNIHost() string {
+	switch a.Type {
+	case HopAddrTypeIP:
+		return a.Host // explicit override required; may be empty (misconfiguration)
+	default: // HopAddrTypeDomain and zero value
+		return a.Addr
+	}
+}
+
+// WsURL builds the WebSocket URL for the HTTP upgrade request.
+// The URL hostname is always SNIHost() so TLS certificate validation uses the
+// correct name. The actual TCP connection is made to DialAddr() via NetDial in
+// dialWebSocketAddr, so domain and IP hops both connect to the right machine.
 func (a HopAddr) WsURL() string {
 	scheme := "ws"
 	if a.TLS {
@@ -70,31 +129,26 @@ func (a HopAddr) WsURL() string {
 	if path == "" {
 		path = "/tunnel"
 	}
-	host := a.Host
-	if host == "" {
-		host = a.IP
-	}
-	return fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(host, fmt.Sprintf("%d", a.Port)), path)
+	return fmt.Sprintf("%s://%s%s", scheme,
+		net.JoinHostPort(a.SNIHost(), fmt.Sprintf("%d", a.Port)), path)
 }
 
-// Identity returns a stable string key for this endpoint: IP+Port+TunnelPath.
-// Host and TLS are excluded — they can change (cert rotation, SNI rename)
-// without changing which physical machine we are talking to.
+// Identity returns a stable string key used to match endpoints across hot-reloads.
+// Key = Type+Addr+Port+TunnelPath. Host and TLS are excluded: the SNI name or
+// TLS mode can change (cert rotation, hostname rename) without replacing the
+// physical endpoint.
 func (a HopAddr) Identity() string {
-	ip := a.IP
-	if ip == "" {
-		ip = a.Host
-	}
 	path := a.TunnelPath
 	if path == "" {
 		path = "/tunnel"
 	}
-	return fmt.Sprintf("%s:%d%s", ip, a.Port, path)
+	return fmt.Sprintf("%s:%s:%d%s", a.Type, a.Addr, a.Port, path)
 }
 
 // Equal reports whether two HopAddrs are fully identical (all fields).
 func (a HopAddr) Equal(b HopAddr) bool {
-	return a.IP == b.IP &&
+	return a.Type == b.Type &&
+		a.Addr == b.Addr &&
 		a.Port == b.Port &&
 		a.Host == b.Host &&
 		a.TLS == b.TLS &&
@@ -113,6 +167,8 @@ func EqualHopAddrs(a, b []HopAddr) bool {
 	}
 	return true
 }
+
+
 
 // NodeType defines the role of this proxy node in the pipeline.
 //
@@ -431,6 +487,11 @@ func (c *Config) validate() error {
 				if len(g.Hops) == 0 {
 					return fmt.Errorf("service %q groups[%d] (%s): at least one hop required", svc.ID, j, g.GroupName())
 				}
+				for k, h := range g.Hops {
+					if err := validateHop(h); err != nil {
+						return fmt.Errorf("service %q groups[%d].hops[%d]: %w", svc.ID, j, k, err)
+					}
+				}
 			}
 		}
 
@@ -452,6 +513,11 @@ func (c *Config) validate() error {
 				for k, g := range r.Groups {
 					if len(g.Hops) == 0 {
 						return fmt.Errorf("relay service %q routes[%d].groups[%d] (%s): at least one hop required", svc.ID, j, k, g.GroupName())
+					}
+					for l, h := range g.Hops {
+						if err := validateHop(h); err != nil {
+							return fmt.Errorf("relay service %q routes[%d].groups[%d].hops[%d]: %w", svc.ID, j, k, l, err)
+						}
 					}
 				}
 			}
@@ -502,4 +568,37 @@ func (c *Config) ServiceByID(id string) (*ServiceConfig, bool) {
 		}
 	}
 	return nil, false
+}
+
+// validateHop checks that a HopAddr is correctly formed for its declared type.
+//
+// Rules:
+//   - type and addr are always required.
+//   - type=ip + tls=true requires host (TLS certificate name cannot be derived
+//     from an IP literal; the relay certificate must match a hostname).
+//   - type=domain must not set host (Addr already is the SNI; setting Host
+//     would cause a mismatch between the dial target and the certificate check).
+func validateHop(h HopAddr) error {
+	if h.Type == "" {
+		return fmt.Errorf("type is required (\"domain\" or \"ip\")")
+	}
+	if h.Addr == "" {
+		return fmt.Errorf("addr is required")
+	}
+	if h.Port == 0 {
+		return fmt.Errorf("port is required")
+	}
+	switch h.Type {
+	case HopAddrTypeIP:
+		if h.TLS && h.Host == "" {
+			return fmt.Errorf("type=ip with tls=true requires host (TLS SNI cannot be derived from an IP)")
+		}
+	case HopAddrTypeDomain:
+		if h.Host != "" {
+			return fmt.Errorf("type=domain must not set host (addr %q is already the SNI; setting host would cause a name mismatch)", h.Addr)
+		}
+	default:
+		return fmt.Errorf("unknown type %q (want \"domain\" or \"ip\")", h.Type)
+	}
+	return nil
 }

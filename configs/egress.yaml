@@ -15,31 +15,21 @@
 node:
   type: egress
   id: egress-beijing-01
-  idc: idc-beijing          # 必填：本节点所在机房，用于校验 TargetIDC
+  idc: idc-beijing
 
 services:
-  # ── 业务 A：本机房内的 HTTP 源站地址 ───────────────────────────────────────
   - id: web-service-a
     origin:
-      host: backend-a.bj.internal   # 北京机房内的源站
+      host: backend-a.bj.internal
       port: 80
       tls: false
       dial_timeout: 10s
 
-  # ── 业务 B：本机房内的数据库 ───────────────────────────────────────────────
   - id: db-service-b
     origin:
       host: db-master.bj.internal
       port: 5432
       dial_timeout: 5s
-
-  # ── 业务 C：本机房不承载（api-service-c 的 target_idc = idc-hongkong）
-  #            香港机房的 egress 节点才需要配置此 service
-  # - id: api-service-c
-  #   origin:
-  #     host: api.hk.internal
-  #     port: 443
-  #     tls: true
 
 tunnel:
   listen_addr: ":9100"

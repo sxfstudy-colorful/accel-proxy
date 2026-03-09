@@ -53,8 +53,6 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	signal.Notify(hup, syscall.SIGHUP)
 
-	// liveCfg tracks the current active config so each reload diffs against
-	// the previous state (not the original startup config).
 	liveCfg := cfg
 
 	for {
@@ -72,9 +70,6 @@ func main() {
 	}
 }
 
-// handleReload re-reads the config file and applies all hot-reloadable changes.
-// Returns the (possibly updated) logger so the caller's variable stays current.
-// On parse error the previous config remains fully in effect.
 func handleReload(n node.Node, configFile string, liveCfg **config.Config, logger *slog.Logger) *slog.Logger {
 	newCfg, err := config.Load(configFile)
 	if err != nil {
@@ -82,7 +77,6 @@ func handleReload(n node.Node, configFile string, liveCfg **config.Config, logge
 		return logger
 	}
 
-	// ── 1. TLS certificate reload ─────────────────────────────────────────
 	if cr, ok := n.(node.CertReloader); ok {
 		if err := cr.ReloadCert(); err != nil {
 			logger.Error("reload: cert reload failed", "err", err)
@@ -91,16 +85,12 @@ func handleReload(n node.Node, configFile string, liveCfg **config.Config, logge
 		}
 	}
 
-	// ── 2. Routes / origins hot-reload ────────────────────────────────────
 	rc := buildReloadableConfig(newCfg)
 	if err := n.Reload(rc); err != nil {
 		logger.Error("reload: config reload failed", "err", err)
 		return logger
 	}
 
-	// ── 3. Log level ──────────────────────────────────────────────────────
-	// Rebuild logger before "complete" so that line prints at the new level.
-	// Compare against *liveCfg (the running baseline), not the startup config.
 	newLogger := logger
 	if newCfg.Log.Level != (*liveCfg).Log.Level {
 		newLogger = buildLogger(newCfg.Log)
@@ -109,14 +99,12 @@ func handleReload(n node.Node, configFile string, liveCfg **config.Config, logge
 			"old", (*liveCfg).Log.Level, "new", newCfg.Log.Level)
 	}
 
-	// ── 4. Advance baseline for next reload ───────────────────────────────
 	*liveCfg = newCfg
 
 	newLogger.Info("reload: complete")
 	return newLogger
 }
 
-// buildReloadableConfig extracts the hot-reloadable subset of a config.
 func buildReloadableConfig(cfg *config.Config) node.ReloadableConfig {
 	rc := node.ReloadableConfig{
 		Groups:   make(map[string][]config.RouteGroup),
@@ -143,7 +131,6 @@ func buildReloadableConfig(cfg *config.Config) node.ReloadableConfig {
 	return rc
 }
 
-// buildNode constructs the correct node type from config.
 func buildNode(cfg *config.Config, logger *slog.Logger) (node.Node, error) {
 	switch cfg.Node.Type {
 	case config.NodeTypeAccess:
@@ -157,7 +144,6 @@ func buildNode(cfg *config.Config, logger *slog.Logger) (node.Node, error) {
 	}
 }
 
-// buildLogger constructs a slog.Logger from the log config.
 func buildLogger(cfg config.LogConfig) *slog.Logger {
 	var level slog.Level
 	switch cfg.Level {

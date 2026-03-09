@@ -60,7 +60,7 @@ func (d *Dialer) tryEndpoint(ep *HopEndpoint, req *HandshakeRequest) (*Transport
 		d.logger.Warn("next-hop dial failed, trying next candidate",
 			"identity", addr.Identity(),
 			"dial_addr", addr.DialAddr(),
-			"host", addr.Host,
+			"sni", addr.SNIHost(),
 			"idc", req.TargetIDC,
 			"err", err,
 		)
@@ -82,7 +82,7 @@ func (d *Dialer) tryEndpoint(ep *HopEndpoint, req *HandshakeRequest) (*Transport
 	elapsed := time.Since(start)
 	d.logger.Debug("tunnel established",
 		"identity", addr.Identity(),
-		"host", addr.Host,
+		"sni", addr.SNIHost(),
 		"idc", req.TargetIDC,
 		"service", req.ServiceID,
 		"latency_ms", elapsed.Milliseconds(),
