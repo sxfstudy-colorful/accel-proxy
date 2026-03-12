@@ -1,0 +1,23 @@
+node:
+  id: mixed-node-02
+  idc: mixed-node-02
+
+relay:
+  tunnel:
+    listen_addr: ":9000"
+  services:
+    - id: http-service-001
+      routes:
+        - idc: idc-beijing
+          groups:
+            - name: primary
+              hops:
+                - type: ip
+                  addr: 192.168.1.203
+                  port: 9000
+                  host: relay-mixed-node-03.internal
+                  tls: false
+
+log:
+  level: info
+  format: text

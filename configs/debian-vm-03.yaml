@@ -1,0 +1,16 @@
+node:
+  id: mixed-node-03
+  idc: idc-beijing
+
+egress:
+  tunnel:
+    listen_addr: ":9000"
+  services:
+    - id: http-service-001
+      origin:
+        host: http-service-001.internal
+        port: 19001
+
+log:
+  level: info
+  format: text
