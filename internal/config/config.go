@@ -86,7 +86,7 @@ type HopAddr struct {
 	Type       HopAddrType `yaml:"type"`
 	Addr       string      `yaml:"addr"`
 	Port       int         `yaml:"port"`
-	Host       string      `yaml:"host"`        // SNI; required for ip+tls, ignored for domain
+	Host       string      `yaml:"host"` // SNI; required for ip+tls, ignored for domain
 	TLS        bool        `yaml:"tls"`
 	TunnelPath string      `yaml:"tunnel_path"`
 }
@@ -103,7 +103,7 @@ func (a HopAddr) DialAddr() string {
 //
 //   - domain: returns Addr — the domain name is its own SNI.
 //   - ip:     returns Host — IP literals cannot carry certificate names; the
-//             operator must explicitly supply the relay's hostname via Host.
+//     operator must explicitly supply the relay's hostname via Host.
 //
 // Returns an empty string only for a misconfigured ip-type hop with no Host.
 // Callers should treat an empty SNIHost with TLS enabled as a configuration error.
@@ -168,8 +168,6 @@ func EqualHopAddrs(a, b []HopAddr) bool {
 	return true
 }
 
-
-
 // Protocol is the business protocol on the client-facing side.
 type Protocol string
 
@@ -217,7 +215,7 @@ type EgressConfig struct {
 // NodeConfig identifies this process instance.
 // It is shared by all roles running in the same process.
 type NodeConfig struct {
-	ID  string `yaml:"id"`
+	ID string `yaml:"id"`
 	// IDC is the datacenter this instance physically lives in.
 	// Required when an EgressConfig section is present.
 	IDC string `yaml:"idc"`
@@ -459,16 +457,8 @@ func Load(path string) (*Config, error) {
 }
 
 func defaultConfig() *Config {
-	defaultTunnel := TunnelConfig{
-		Path:         "/tunnel",
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		MaxFrameSize: 64 * 1024,
-	}
 	return &Config{
-		Relay:  &RelayConfig{Tunnel: defaultTunnel},
-		Egress: &EgressConfig{Tunnel: defaultTunnel},
-		Log:    LogConfig{Level: "info", Format: "text"},
+		Log: LogConfig{Level: "info", Format: "text"},
 	}
 }
 
@@ -574,7 +564,6 @@ func (c *Config) validateEgress(e *EgressConfig) error {
 	}
 	return nil
 }
-
 
 // validateHop checks that a HopAddr is correctly formed for its declared type.
 //
