@@ -1,12 +1,12 @@
-// testclient is a standalone proxy test client for accel-proxy.
+// proxy-test-client is a standalone proxy test client for accel-proxy.
 //
 // Each "mode" exercises a different aspect of the proxy chain.
 // -addr points to the accel-proxy access node; the client never talks to
-// testserver directly.
+// proxy-test-server directly.
 //
 // Usage:
 //
-//	testclient -mode <mode> [flags]
+//	proxy-test-client -mode <mode> [flags]
 //
 // Global flags:
 //
@@ -78,10 +78,10 @@ func main() {
 	flag.DurationVar(&g.timeout, "timeout", 10*time.Second, "per-operation timeout")
 	flag.BoolVar(&g.verbose, "v", false, "verbose output")
 
-	msg    := flag.String("msg",    "hello accel-proxy\n", "payload for tcp-echo")
-	size   := flag.Int64("size",   1024*1024,              "bytes for large mode")
-	delay  := flag.Int("delay",    500,                    "backend sleep ms for slow mode")
-	wsmsgs := flag.Int("wsmsgs",   5,                      "messages per WS connection")
+	msg := flag.String("msg", "hello accel-proxy\n", "payload for tcp-echo")
+	size := flag.Int64("size", 1024*1024, "bytes for large mode")
+	delay := flag.Int("delay", 500, "backend sleep ms for slow mode")
+	wsmsgs := flag.Int("wsmsgs", 5, "messages per WS connection")
 
 	flag.Parse()
 
@@ -152,7 +152,7 @@ func runTCPEcho(g globalFlags, msg string, logger *slog.Logger) error {
 		err error
 		dur time.Duration
 	}
-	jobs    := make(chan int, g.n)
+	jobs := make(chan int, g.n)
 	results := make(chan result, g.n)
 	for i := 0; i < g.n; i++ {
 		jobs <- i
@@ -241,8 +241,8 @@ func runHTTPGet(g globalFlags, logger *slog.Logger) error {
 
 func runHTTPPost(g globalFlags, logger *slog.Logger) error {
 	client := httpClient(g.timeout)
-	url     := fmt.Sprintf("http://%s/body", g.addr)
-	payload := "test payload from testclient"
+	url := fmt.Sprintf("http://%s/body", g.addr)
+	payload := "test payload from proxy-test-client"
 	logger.Info("http-post", "url", url, "n", g.n, "conc", g.conc)
 	return runHTTPParallel(g, logger, func(id int) error {
 		resp, err := client.Post(url, "text/plain", strings.NewReader(payload))
@@ -264,7 +264,7 @@ func runHTTPPost(g globalFlags, logger *slog.Logger) error {
 
 func runHTTPHeaders(g globalFlags, logger *slog.Logger) error {
 	client := httpClient(g.timeout)
-	url    := fmt.Sprintf("http://%s/headers", g.addr)
+	url := fmt.Sprintf("http://%s/headers", g.addr)
 	logger.Info("http-hdr", "url", url)
 	resp, err := client.Get(url)
 	if err != nil {
@@ -287,7 +287,7 @@ func runHTTPHeaders(g globalFlags, logger *slog.Logger) error {
 
 func runLarge(g globalFlags, size int64, logger *slog.Logger) error {
 	client := httpClient(g.timeout + 60*time.Second)
-	url    := fmt.Sprintf("http://%s/large?n=%d", g.addr, size)
+	url := fmt.Sprintf("http://%s/large?n=%d", g.addr, size)
 	logger.Info("large", "url", url, "size_bytes", size)
 
 	start := time.Now()
@@ -317,7 +317,7 @@ func runLarge(g globalFlags, size int64, logger *slog.Logger) error {
 			return fmt.Errorf("read at offset %d: %w", totalRead, err)
 		}
 	}
-	dur  := time.Since(start)
+	dur := time.Since(start)
 	mbps := float64(totalRead) / dur.Seconds() / (1024 * 1024)
 	if totalRead != size {
 		return fmt.Errorf("size mismatch: expected %d got %d", size, totalRead)
@@ -336,7 +336,7 @@ func runLarge(g globalFlags, size int64, logger *slog.Logger) error {
 
 func runSlow(g globalFlags, delay int, logger *slog.Logger) error {
 	client := httpClient(g.timeout + time.Duration(delay)*time.Millisecond + 5*time.Second)
-	url    := fmt.Sprintf("http://%s/slow?ms=%d", g.addr, delay)
+	url := fmt.Sprintf("http://%s/slow?ms=%d", g.addr, delay)
 	logger.Info("slow", "url", url, "backend_delay_ms", delay)
 
 	start := time.Now()
@@ -346,15 +346,15 @@ func runSlow(g globalFlags, delay int, logger *slog.Logger) error {
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body) //nolint:errcheck
-	dur      := time.Since(start)
+	dur := time.Since(start)
 	overhead := dur - time.Duration(delay)*time.Millisecond
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	logger.Info("slow result",
-		"total_latency",  dur.Round(time.Millisecond),
-		"backend_delay",  time.Duration(delay)*time.Millisecond,
+		"total_latency", dur.Round(time.Millisecond),
+		"backend_delay", time.Duration(delay)*time.Millisecond,
 		"proxy_overhead", overhead.Round(time.Millisecond),
 	)
 	const maxOverhead = 500 * time.Millisecond
@@ -384,7 +384,7 @@ func runWSEcho(g globalFlags, msgsPerConn int, logger *slog.Logger) error {
 		err error
 		dur time.Duration
 	}
-	jobs    := make(chan int, g.n)
+	jobs := make(chan int, g.n)
 	results := make(chan result, g.n)
 	for i := 0; i < g.n; i++ {
 		jobs <- i
@@ -504,7 +504,7 @@ func runWSLatency(g globalFlags, msgsPerConn int, logger *slog.Logger) error {
 	for c := 0; c < g.n; c++ {
 		for m := 0; m < msgsPerConn; m++ {
 			payload := fmt.Sprintf("conn=%d msg=%d", c, m)
-			sendAt  := time.Now()
+			sendAt := time.Now()
 			conn.SetWriteDeadline(sendAt.Add(g.timeout))
 			if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
 				return fmt.Errorf("write c=%d m=%d: %w", c, m, err)
@@ -557,11 +557,11 @@ func runWSLatency(g globalFlags, msgsPerConn int, logger *slog.Logger) error {
 
 func runBench(g globalFlags, logger *slog.Logger) error {
 	client := httpClient(g.timeout)
-	url    := fmt.Sprintf("http://%s/hello", g.addr)
+	url := fmt.Sprintf("http://%s/hello", g.addr)
 	logger.Info("bench", "url", url, "n", g.n, "conc", g.conc)
 
 	latencies := make([]time.Duration, g.n)
-	var idx      atomic.Int64
+	var idx atomic.Int64
 	var errCount atomic.Int64
 
 	jobs := make(chan int, g.n)
@@ -599,7 +599,7 @@ func runBench(g globalFlags, logger *slog.Logger) error {
 	elapsed := time.Since(start)
 
 	total := int(idx.Load())
-	rps   := float64(total) / elapsed.Seconds()
+	rps := float64(total) / elapsed.Seconds()
 
 	collected := latencies[:total]
 	sortDurations(collected)

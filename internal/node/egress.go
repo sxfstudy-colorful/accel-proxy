@@ -46,7 +46,7 @@ type EgressNode struct {
 	reloadMu sync.Mutex
 }
 
-var _ Node         = (*EgressNode)(nil)
+var _ Node = (*EgressNode)(nil)
 var _ CertReloader = (*EgressNode)(nil)
 
 // NewEgressNode constructs an EgressNode from its dedicated role config.
@@ -148,12 +148,25 @@ func dialOrigin(addr string, useTLS bool, timeout time.Duration) (net.Conn, erro
 	if err != nil {
 		return nil, fmt.Errorf("tcp dial %q: %w", addr, err)
 	}
+
 	if useTLS {
+		// 给整个 TLS 握手阶段也设上 deadline
+		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("set deadline %q: %w", addr, err)
+		}
+
 		host, _, _ := net.SplitHostPort(addr)
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
 		if err := tlsConn.HandshakeContext(context.Background()); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil, fmt.Errorf("tls handshake %q: %w", addr, err)
+		}
+
+		// 握手完成后清除 deadline，交给上层业务自己管理
+		if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+			_ = tlsConn.Close()
+			return nil, fmt.Errorf("clear deadline %q: %w", addr, err)
 		}
 		return tlsConn, nil
 	}

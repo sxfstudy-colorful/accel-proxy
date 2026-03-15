@@ -1,4 +1,4 @@
-// testserver is a standalone origin server for accel-proxy integration testing.
+// proxy-test-server is a standalone origin server for accel-proxy integration testing.
 //
 // It runs two servers simultaneously:
 //
@@ -7,7 +7,7 @@
 //
 // Usage:
 //
-//	testserver [flags]
+//	proxy-test-server [flags]
 //
 //	-tcp-addr  string   TCP echo listen address  (default "0.0.0.0:19000")
 //	-http-addr string   HTTP listen address       (default "0.0.0.0:19001")
@@ -71,7 +71,7 @@ var wsUpgrader = websocket.Upgrader{
 // ─────────────────────────────────────────────────────────────────────────────
 
 func main() {
-	tcpAddr  := flag.String("tcp-addr",  "0.0.0.0:19000", "TCP echo listen address")
+	tcpAddr := flag.String("tcp-addr", "0.0.0.0:19000", "TCP echo listen address")
 	httpAddr := flag.String("http-addr", "0.0.0.0:19001", "HTTP listen address")
 	flag.Parse()
 
@@ -113,11 +113,11 @@ func main() {
 	tcpLn.Close()
 	httpServer.Close()
 	logger.Info("shutdown complete",
-		"tcp_conns",   globalStats.TCPConns.Load(),
-		"http_reqs",   globalStats.HTTPReqs.Load(),
-		"ws_conns",    globalStats.WSConns.Load(),
+		"tcp_conns", globalStats.TCPConns.Load(),
+		"http_reqs", globalStats.HTTPReqs.Load(),
+		"ws_conns", globalStats.WSConns.Load(),
 		"ws_messages", globalStats.WSMessages.Load(),
-		"bytes_echoed",globalStats.BytesEchoed.Load(),
+		"bytes_echoed", globalStats.BytesEchoed.Load(),
 	)
 }
 

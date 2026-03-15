@@ -102,11 +102,13 @@ func (s *TunnelSession) RunRelay(outbound *Transport) {
 func (s *TunnelSession) RunOrigin(origin net.Conn) {
 	s.logger.Info("session: origin relay started",
 		"origin", origin.RemoteAddr())
+
 	defer func() {
-		origin.Close()
+		_ = origin.Close()
 		s.logger.Info("session: origin relay finished",
 			"duration", time.Since(s.startAt).Round(time.Millisecond).String())
 	}()
+
 	Relay(origin, s.inbound, s.logger)
 }
 

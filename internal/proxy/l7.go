@@ -93,6 +93,10 @@ func (h *HTTPConnHandler) handleWebSocket(
 		writeHTTPError(clientConn, http.StatusBadGateway, "bad gateway", h.logger)
 		return
 	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		h.logger.Warn("WS: origin rejected upgrade",
@@ -137,8 +141,17 @@ func (h *HTTPConnHandler) handleConnect(
 		writeHTTPError(clientConn, http.StatusBadGateway, "bad gateway", h.logger)
 		return
 	}
+	// Always drain up to connectBodyDrainLimit bytes and close resp.Body:
+	//   - non-200: releases the body reader on tunnelBR (防止残留字节污染后续读取)
+	//   - 200:     resp.Body is eofReader, so drain and Close are both no-ops
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
+		h.logger.Warn("CONNECT: upstream rejected",
+			"status", resp.StatusCode, "target", req.Host)
 		if err := resp.Write(clientConn); err != nil {
 			h.logger.Debug("CONNECT: write rejection to client", "err", err)
 		}
@@ -178,7 +191,10 @@ func (h *HTTPConnHandler) handleHTTP(
 		writeHTTPError(clientConn, http.StatusBadGateway, "bad gateway", h.logger)
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
 
 	resp.Header.Set("X-Proxy", "accel-proxy")
 
@@ -267,8 +283,8 @@ var hopByHopHeaders = []string{
 // Safety ordering:
 //  1. Flush phase  (serial)     — drain bufio residuals into the peer.
 //  2. Relay phase  (concurrent) — one goroutine per direction, no shared
-//                                 read state, Transport.dead enforces
-//                                 no-retry on write failure.
+//     read state, Transport.dead enforces
+//     no-retry on write failure.
 func relayBuffered(
 	a net.Conn, aBR *bufio.Reader,
 	b *tunnel.Transport, bBR *bufio.Reader,
@@ -290,7 +306,7 @@ func relayBuffered(
 	// a → b: when this fails, b.Close() poisons b.dead=true, which makes
 	// the b→a goroutine's Read(b) return EOF via the closed io.Pipe.
 	go func() {
-		defer func() { b.Close(); done <- struct{}{} }()
+		defer func() { _ = b.Close(); done <- struct{}{} }()
 		buf := make([]byte, 32*1024)
 		if _, err := io.CopyBuffer(b, a, buf); err != nil &&
 			!isClosedConn(err) && !errors.Is(err, tunnel.ErrTransportDead) {
@@ -301,7 +317,7 @@ func relayBuffered(
 	// b → a: Read(b) drains the io.Pipe; when the pipe is closed by
 	// b.Close() above, Read returns EOF and this goroutine exits.
 	go func() {
-		defer func() { a.Close(); done <- struct{}{} }()
+		defer func() { _ = a.Close(); done <- struct{}{} }()
 		buf := make([]byte, 32*1024)
 		if _, err := io.CopyBuffer(a, b, buf); err != nil && !isClosedConn(err) {
 			logger.Debug("relay b→a", "err", err)
@@ -366,7 +382,7 @@ func writeHTTPError(conn net.Conn, code int, msg string, logger *slog.Logger) {
 		return
 	}
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf,
+	_, _ = fmt.Fprintf(&buf,
 		"HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
 		code, http.StatusText(code), len(msg), msg,
 	)

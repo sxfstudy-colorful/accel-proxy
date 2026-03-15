@@ -158,7 +158,9 @@ func (inst *serviceInstance) acceptLoop(ctx context.Context) {
 
 // handleConn processes one inbound client connection.
 func (inst *serviceInstance) handleConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	clientAddr, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 
@@ -188,6 +190,10 @@ func (inst *serviceInstance) handleConn(conn net.Conn) {
 			"target_idc", state.targetIDC, "err", err)
 		return
 	}
+
+	defer func() {
+		_ = tun.Close()
+	}()
 
 	switch inst.cfg.Protocol {
 	case config.ProtocolHTTP, config.ProtocolHTTPS:
