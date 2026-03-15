@@ -190,6 +190,7 @@ func (h *HTTPConnHandler) handleHTTP(
 	if strings.EqualFold(req.Header.Get("Connection"), "close") {
 		return false
 	}
+
 	if strings.EqualFold(resp.Header.Get("Connection"), "close") {
 		return false
 	}

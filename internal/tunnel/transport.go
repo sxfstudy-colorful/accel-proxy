@@ -117,16 +117,18 @@ func (t *Transport) Write(p []byte) (int, error) {
 		}
 
 		t.writeMu.Lock()
-		t.conn.SetWriteDeadline(time.Now().Add(writeDeadlineBuffer + pingInterval))
+		if err := t.conn.SetWriteDeadline(time.Now().Add(writeDeadlineBuffer + pingInterval)); err != nil {
+			t.writeMu.Unlock()
+			t.markDead()
+			return total, fmt.Errorf("set transport deadline err: %w", err)
+		}
+
 		err := t.conn.WriteMessage(websocket.BinaryMessage, p[:n])
 		t.writeMu.Unlock()
 
 		if err != nil {
-			// Mark dead before returning so any concurrent goroutine that
-			// calls Write next sees the dead flag and bails immediately,
-			// rather than attempting to write to a broken connection.
 			t.markDead()
-			return total, fmt.Errorf("transport write: %w", err)
+			return total, fmt.Errorf("transport write err: %w", err)
 		}
 		p = p[n:]
 		total += n
@@ -141,10 +143,11 @@ func (t *Transport) Close() error {
 	t.closeOnce.Do(func() {
 		t.pw.Close()
 		t.writeMu.Lock()
-		t.conn.SetWriteDeadline(time.Now().Add(writeDeadlineBuffer))
-		// Best-effort close frame: the peer should receive a clean close, but
-		// if this write fails the underlying conn.Close() below still tears
-		// down the TCP connection. We intentionally discard this error.
+
+		if err := t.conn.SetWriteDeadline(time.Now().Add(writeDeadlineBuffer)); err != nil {
+			t.logger.Info("transport set write deadline", "err", err)
+		}
+
 		if err := t.conn.WriteMessage(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
