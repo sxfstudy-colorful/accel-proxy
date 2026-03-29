@@ -16,11 +16,6 @@ import (
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EgressNode
-//
-// 职责：终结隧道，连接本机房源站。
-//
-// 构造：只依赖 *config.EgressConfig、nodeID、nodeIDC，与其他角色完全解耦。
-// 热重载：originTable 通过 atomic.Pointer 持有，Reload() 原子替换。
 // ─────────────────────────────────────────────────────────────────────────────
 
 type originEntry struct {
@@ -36,7 +31,6 @@ func (e *originEntry) addr() string {
 
 type originTable map[string]*originEntry
 
-// EgressNode terminates tunnels and connects to real origin servers.
 type EgressNode struct {
 	baseNode
 	nodeID  string
@@ -44,17 +38,22 @@ type EgressNode struct {
 
 	origins  atomic.Pointer[originTable]
 	reloadMu sync.Mutex
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 var _ Node = (*EgressNode)(nil)
 var _ CertReloader = (*EgressNode)(nil)
 
-// NewEgressNode constructs an EgressNode from its dedicated role config.
 func NewEgressNode(nodeID, nodeIDC string, cfg *config.EgressConfig, logger *slog.Logger) *EgressNode {
+	ctx, cancel := context.WithCancel(context.Background())
 	n := &EgressNode{
 		baseNode: baseNode{logger: logger},
 		nodeID:   nodeID,
 		nodeIDC:  nodeIDC,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 	tbl := buildOriginTable(cfg.Services)
 	n.origins.Store(&tbl)
@@ -71,7 +70,10 @@ func (n *EgressNode) Start() error {
 	return n.startServer("egress:" + n.nodeID)
 }
 
-func (n *EgressNode) Stop() { n.stopServer() }
+func (n *EgressNode) Stop() {
+	n.cancel() // Cancel context to abort pending origin dials.
+	n.stopServer()
+}
 
 func (n *EgressNode) ReloadCert() error { return n.reloadCert() }
 
@@ -119,7 +121,7 @@ func (n *EgressNode) handleTunnel(req *tunnel.HandshakeRequest, inbound *tunnel.
 		return
 	}
 
-	origin, err := dialOrigin(entry.addr(), entry.useTLS || req.Protocol == "https", entry.dialTimeout)
+	origin, err := dialOrigin(n.ctx, entry.addr(), entry.useTLS || req.Protocol == "https", entry.dialTimeout)
 	if err != nil {
 		session.Logger().Error("egress: dial origin failed", "origin", entry.addr(), "err", err)
 		return
@@ -143,14 +145,19 @@ func buildOriginTable(services []config.ServiceConfig) originTable {
 	return tbl
 }
 
-func dialOrigin(addr string, useTLS bool, timeout time.Duration) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", addr, timeout)
+// dialOrigin connects to the real origin server.
+// Uses ctx for cancellation support during graceful shutdown.
+func dialOrigin(ctx context.Context, addr string, useTLS bool, timeout time.Duration) (net.Conn, error) {
+	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
+	defer dialCancel()
+
+	var d net.Dialer
+	conn, err := d.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("tcp dial %q: %w", addr, err)
 	}
 
 	if useTLS {
-		// 给整个 TLS 握手阶段也设上 deadline
 		if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("set deadline %q: %w", addr, err)
@@ -158,12 +165,11 @@ func dialOrigin(addr string, useTLS bool, timeout time.Duration) (net.Conn, erro
 
 		host, _, _ := net.SplitHostPort(addr)
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: host})
-		if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+		if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("tls handshake %q: %w", addr, err)
 		}
 
-		// 握手完成后清除 deadline，交给上层业务自己管理
 		if err := tlsConn.SetDeadline(time.Time{}); err != nil {
 			_ = tlsConn.Close()
 			return nil, fmt.Errorf("clear deadline %q: %w", addr, err)

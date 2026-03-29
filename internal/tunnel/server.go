@@ -14,12 +14,9 @@ import (
 	"github.com/sxfstudy-colorful/accel-proxy/internal/config"
 )
 
-// certPollInterval is how often the background goroutine checks whether
-// the cert/key files on disk have changed.
 const certPollInterval = 30 * time.Second
 
 // ConnHandler is called for each accepted tunnel connection.
-// The handler is responsible for closing the Transport when done.
 type ConnHandler func(req *HandshakeRequest, tun *Transport)
 
 // Server is a WebSocket server that accepts inbound tunnel connections
@@ -32,7 +29,7 @@ type Server struct {
 	logger   *slog.Logger
 
 	httpServer   *http.Server
-	certReloader *CertReloader // non-nil when TLS is enabled
+	certReloader *CertReloader
 }
 
 // NewServer creates a tunnel Server.
@@ -43,15 +40,15 @@ func NewServer(cfg *config.TunnelConfig, nodeID string, handler ConnHandler, log
 	}
 
 	s := &Server{
-		cfg:    cfg,
-		nodeID: nodeID,
+		cfg:     cfg,
+		nodeID:  nodeID,
 		handler: handler,
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 10 * time.Second,
 			ReadBufferSize:   int(cfg.MaxFrameSize) + 512,
 			WriteBufferSize:  int(cfg.MaxFrameSize) + 512,
 			CheckOrigin: func(r *http.Request) bool {
-				return true // trust internal network; add auth header check if needed
+				return true // trust internal network; PSK auth covers authentication
 			},
 		},
 		logger: logger,
@@ -72,9 +69,6 @@ func NewServer(cfg *config.TunnelConfig, nodeID string, handler ConnHandler, log
 }
 
 // Start begins listening for tunnel connections (blocking).
-// When TLS is enabled the certificate is loaded dynamically: replacing the
-// cert/key files on disk (e.g. via Let's Encrypt renewal or manual rotation)
-// is picked up within certPollInterval without any restart.
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp", s.httpServer.Addr)
 	if err != nil {
@@ -85,10 +79,10 @@ func (s *Server) Start() error {
 		"addr", s.httpServer.Addr,
 		"path", s.cfg.Path,
 		"tls", s.cfg.TLS.Enabled,
+		"auth", s.cfg.PSK != "",
 	)
 
 	if s.cfg.TLS.Enabled {
-		// Build a CertReloader that polls every certPollInterval.
 		reloader, err := NewCertReloader(
 			s.cfg.TLS.CertFile,
 			s.cfg.TLS.KeyFile,
@@ -100,7 +94,6 @@ func (s *Server) Start() error {
 		}
 		s.certReloader = reloader
 
-		// Log initial cert info.
 		info := reloader.CertInfo()
 		s.logger.Info("TLS certificate loaded",
 			"subject", info.Subject,
@@ -111,9 +104,6 @@ func (s *Server) Start() error {
 		)
 
 		tlsCfg := &tls.Config{
-			// GetCertificate is called on every TLS handshake.
-			// The reloader returns the certificate currently in memory,
-			// which may have been swapped by the background goroutine.
 			GetCertificate: reloader.GetCertificate,
 			MinVersion:     tls.VersionTLS12,
 			NextProtos:     []string{"http/1.1"},
@@ -136,7 +126,6 @@ func (s *Server) Stop(ctx context.Context) error {
 func (s *Server) ListenAddr() string { return s.httpServer.Addr }
 
 // ReloadCert triggers an immediate certificate reload from disk.
-// Intended to be wired to a SIGHUP handler in main().
 func (s *Server) ReloadCert() error {
 	if s.certReloader == nil {
 		return fmt.Errorf("TLS is not enabled on this server")
@@ -161,6 +150,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ── PSK authentication ───────────────────────────────────────────────
+	if err := VerifyRequest(req, s.cfg.PSK); err != nil {
+		s.logger.Warn("tunnel auth failed", "remote", r.RemoteAddr, "err", err)
+		_ = SendResponse(conn, ErrResponse(s.nodeID, "authentication failed"))
+		conn.Close()
+		return
+	}
+
 	if err := SendResponse(conn, OKResponse(s.nodeID)); err != nil {
 		s.logger.Warn("handshake response failed", "remote", r.RemoteAddr, "err", err)
 		conn.Close()
@@ -176,14 +173,19 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	)
 
 	tun := NewTransport(conn, s.cfg.MaxFrameSize, s.logger)
+	defer func() {
+		tun.Close()
+		if e := recover(); e != nil {
+			s.logger.Error("handler panic", "remote", r.RemoteAddr, "panic", e)
+		}
+	}()
+
 	s.handler(req, tun)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write([]byte("ok")); err != nil {
-		// ResponseWriter write errors are non-actionable (client already gone);
-		// the http.Server framework handles connection cleanup.
 		_ = err
 	}
 }

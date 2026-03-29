@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"fmt"
 	"log/slog"
 	"time"
 )
@@ -8,28 +9,16 @@ import (
 const tunnelDialTimeout = 10 * time.Second
 
 // Dialer dials next-hop WebSocket tunnel endpoints via a HopPool.
-//
-// The HopPool owns endpoint selection (round-robin, latency-based), health
-// state, and hot-reload. The Dialer's responsibilities are:
-//  1. Ask the pool which endpoints to try (pick).
-//  2. Attempt dial + handshake on each candidate in order.
-//  3. Feed results back to the pool (reportResult).
-//
-// # Fallback safety boundary
-//
-// DialWithFallback is the ONLY place where retrying across multiple candidates
-// is permitted — no user data has been sent yet, only routing metadata in
-// HandshakeRequest. Once it returns a Transport, the pre-data phase ends.
-// Transport.dead then enforces the no-retry contract for data relay.
 type Dialer struct {
 	pool      *HopPool
 	frameSize int64
+	psk       string // pre-shared key for HMAC signing; empty = unsigned mode
 	logger    *slog.Logger
 }
 
 // NewDialer creates a Dialer backed by the given HopPool.
-func NewDialer(pool *HopPool, frameSize int64, logger *slog.Logger) *Dialer {
-	return &Dialer{pool: pool, frameSize: frameSize, logger: logger}
+func NewDialer(pool *HopPool, frameSize int64, psk string, logger *slog.Logger) *Dialer {
+	return &Dialer{pool: pool, frameSize: frameSize, psk: psk, logger: logger}
 }
 
 // Pool returns the underlying HopPool.
@@ -50,11 +39,8 @@ func (d *Dialer) DialWithFallback(req *HandshakeRequest) (*Transport, error) {
 // tryEndpoint attempts a single dial + handshake against ep.
 func (d *Dialer) tryEndpoint(ep *HopEndpoint, req *HandshakeRequest) (*Transport, time.Duration, error) {
 	start := time.Now()
-	addr := ep.Addr() // snapshot: safe even if hot-reload concurrently updates addr
+	addr := ep.Addr()
 
-	// ── Step 1: TCP + WebSocket dial ─────────────────────────────────────
-	// Uses addr.DialAddr() for TCP (IP:Port) and addr.WsURL() for HTTP Host/SNI.
-	// Failure: no bytes sent, safe to try next candidate.
 	conn, err := dialWebSocketAddr(addr)
 	if err != nil {
 		d.logger.Warn("next-hop dial failed, trying next candidate",
@@ -67,9 +53,10 @@ func (d *Dialer) tryEndpoint(ep *HopEndpoint, req *HandshakeRequest) (*Transport
 		return nil, time.Since(start), err
 	}
 
-	// ── Step 2: tunnel handshake (routing metadata only, no user data) ───
-	// Failure: only HandshakeRequest bytes sent. Safe to close and try next.
-	if _, err := SendHandshake(conn, req); err != nil {
+	// Sign the request before sending if PSK is configured.
+	SignRequest(req, d.psk)
+
+	if resp, err := SendHandshake(conn, req); err != nil {
 		conn.Close()
 		d.logger.Warn("next-hop handshake failed, trying next candidate",
 			"identity", addr.Identity(),
@@ -77,6 +64,14 @@ func (d *Dialer) tryEndpoint(ep *HopEndpoint, req *HandshakeRequest) (*Transport
 			"err", err,
 		)
 		return nil, time.Since(start), err
+	} else if resp.Status != RespStatusOk {
+		conn.Close()
+		d.logger.Warn("next-hop handshake failed, trying next candidate",
+			"identity", addr.Identity(),
+			"idc", req.TargetIDC,
+			"err", fmt.Sprint("status: %s, message: %s", resp.Status, resp.Message),
+		)
+		return nil, time.Since(start), fmt.Errorf("status: %s, message: %s", resp.Status, resp.Message)
 	}
 
 	elapsed := time.Since(start)
@@ -89,5 +84,3 @@ func (d *Dialer) tryEndpoint(ep *HopEndpoint, req *HandshakeRequest) (*Transport
 	)
 	return NewTransport(conn, d.frameSize, d.logger), elapsed, nil
 }
-
-

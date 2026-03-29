@@ -2,18 +2,17 @@
 package proxy
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/sxfstudy-colorful/accel-proxy/internal/netutil"
 )
 
 // L4Proxy is a transparent TCP proxy.
-// It accepts a client net.Conn and forwards raw bytes to/from the target.
 type L4Proxy struct {
 	DialTimeout time.Duration
 	logger      *slog.Logger
@@ -27,8 +26,7 @@ func NewL4Proxy(dialTimeout time.Duration, logger *slog.Logger) *L4Proxy {
 	return &L4Proxy{DialTimeout: dialTimeout, logger: logger}
 }
 
-// Handle connects to target and relays bytes bidirectionally until either
-// side closes the connection.
+// Handle connects to target and relays bytes bidirectionally.
 func (p *L4Proxy) Handle(client net.Conn, targetHost string, targetPort int) {
 	defer client.Close()
 
@@ -58,7 +56,7 @@ func relay(a, b net.Conn, logger *slog.Logger) {
 		defer dst.Close()
 		buf := make([]byte, 32*1024)
 		n, err := io.CopyBuffer(dst, src, buf)
-		if err != nil && !isClosedErr(err) {
+		if err != nil && !netutil.IsExpectedCloseErr(err) {
 			logger.Debug("relay copy", "dir", label, "bytes", n, "err", err)
 		}
 	}
@@ -67,18 +65,4 @@ func relay(a, b net.Conn, logger *slog.Logger) {
 	go copyHalf(b, a, "client→origin")
 
 	wg.Wait()
-}
-
-func isClosedErr(err error) bool {
-	if err == nil || errors.Is(err, io.EOF) {
-		return true
-	}
-	var ne *net.OpError
-	if errors.As(err, &ne) {
-		s := ne.Err.Error()
-		return strings.Contains(s, "use of closed network connection") ||
-			strings.Contains(s, "connection reset by peer") ||
-			strings.Contains(s, "broken pipe")
-	}
-	return false
 }

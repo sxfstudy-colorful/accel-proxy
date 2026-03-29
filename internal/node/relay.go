@@ -1,6 +1,7 @@
 package node
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -10,21 +11,12 @@ import (
 	"github.com/sxfstudy-colorful/accel-proxy/internal/tunnel"
 )
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RelayNode
-//
-// 职责：接受入向隧道，按 TargetIDC 查路由表，转发到下一跳。
-//
-// 构造：只依赖 *config.RelayConfig 和 nodeID，与其他角色完全解耦。
-// 热重载：routeTable 通过 atomic.Pointer 持有，handleTunnel 快照隔离。
-// ─────────────────────────────────────────────────────────────────────────────
-
 type routeTable map[string][]config.IDCRoute
 
-// RelayNode forwards tunnels toward the target IDC.
 type RelayNode struct {
 	baseNode
 	nodeID string
+	psk    string
 
 	routes   atomic.Pointer[routeTable]
 	reloadMu sync.Mutex
@@ -32,6 +24,11 @@ type RelayNode struct {
 	dialersMu sync.RWMutex
 	dialers   map[dialerKey]*tunnel.Dialer
 	frameSize int64
+
+	// ctx/cancel control the lifecycle of background goroutines (probers).
+	// cancel is called in Stop() to cleanly shut down all probers.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type dialerKey struct{ serviceID, idc string }
@@ -39,13 +36,16 @@ type dialerKey struct{ serviceID, idc string }
 var _ Node         = (*RelayNode)(nil)
 var _ CertReloader = (*RelayNode)(nil)
 
-// NewRelayNode constructs a RelayNode from its dedicated role config.
 func NewRelayNode(nodeID string, cfg *config.RelayConfig, logger *slog.Logger) (*RelayNode, error) {
+	ctx, cancel := context.WithCancel(context.Background())
 	n := &RelayNode{
 		baseNode:  baseNode{logger: logger},
 		nodeID:    nodeID,
+		psk:       cfg.Tunnel.PSK,
 		frameSize: cfg.Tunnel.MaxFrameSize,
 		dialers:   make(map[dialerKey]*tunnel.Dialer),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 
 	tbl, err := buildRouteTable(cfg.Services)
@@ -64,7 +64,10 @@ func (n *RelayNode) Start() error {
 	return n.startServer("relay:" + n.nodeID)
 }
 
-func (n *RelayNode) Stop() { n.stopServer() }
+func (n *RelayNode) Stop() {
+	n.cancel() // stop all prober goroutines
+	n.stopServer()
+}
 
 func (n *RelayNode) ReloadCert() error { return n.reloadCert() }
 
@@ -84,8 +87,30 @@ func (n *RelayNode) Reload(rc ReloadableConfig) error {
 		next[svcID] = routes
 	}
 	n.routes.Store(&next)
+
+	n.cleanStaleDialers(next)
+
 	n.logger.Info("relay: routes hot-reloaded", "updated_services", len(rc.Routes))
 	return nil
+}
+
+func (n *RelayNode) cleanStaleDialers(routes routeTable) {
+	valid := make(map[dialerKey]struct{})
+	for svcID, idcRoutes := range routes {
+		for _, rt := range idcRoutes {
+			valid[dialerKey{svcID, rt.IDC}] = struct{}{}
+		}
+	}
+
+	n.dialersMu.Lock()
+	defer n.dialersMu.Unlock()
+	for key := range n.dialers {
+		if _, ok := valid[key]; !ok {
+			n.logger.Info("relay: removing stale dialer",
+				"service", key.serviceID, "idc", key.idc)
+			delete(n.dialers, key)
+		}
+	}
 }
 
 func (n *RelayNode) handleTunnel(req *tunnel.HandshakeRequest, inbound *tunnel.Transport) {
@@ -140,7 +165,9 @@ func (n *RelayNode) dialerFor(serviceID, idc string, nextHops []config.HopAddr) 
 		return d
 	}
 	pool := tunnel.NewHopPool(nextHops, nil, n.logger)
-	d = tunnel.NewDialer(pool, n.frameSize, n.logger)
+	// FIX: use node's ctx so prober stops when RelayNode.Stop() is called.
+	pool.StartProber(n.ctx, defaultProbeInterval)
+	d = tunnel.NewDialer(pool, n.frameSize, n.psk, n.logger)
 	n.dialers[key] = d
 	return d
 }

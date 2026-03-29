@@ -7,61 +7,40 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sxfstudy-colorful/accel-proxy/internal/config"
 	"github.com/sxfstudy-colorful/accel-proxy/internal/proxy"
 	"github.com/sxfstudy-colorful/accel-proxy/internal/tunnel"
 )
 
+const defaultProbeInterval = 10 * time.Second
+
 // ─────────────────────────────────────────────────────────────────────────────
-// serviceInstance — per-service lifecycle owner
-//
-// Each service gets its own instance that owns:
-//   - the TCP listener bound to the service port
-//   - the accept loop goroutine (and all connection goroutines it spawns)
-//   - the hot-reloadable routing state (dialer + targetIDC)
-//   - the L7 handler (nil for TCP services)
-//
-// Lifecycle:
-//   newServiceInstance → start() → [running] → stop()
-//
-// Hot-reload updates only the state pointer; the listener and l7handler
-// are immutable for the lifetime of the instance (port/protocol change
-// requires stop + new instance).
+// serviceState / serviceInstance
 // ─────────────────────────────────────────────────────────────────────────────
 
-// serviceState is the hot-reloadable portion of a service instance.
-// Swapped atomically on Reload; in-flight connections keep their snapshot.
 type serviceState struct {
 	dialer    *tunnel.Dialer
 	targetIDC string
 }
 
-// serviceInstance owns one service's complete runtime lifecycle.
 type serviceInstance struct {
-	// cfg holds the immutable fields: ID, Port, Protocol.
-	// Mutable routing (Groups) lives in state.
-	cfg config.ServiceConfig
-
-	// state is replaced atomically on Reload.
-	// Each connection snapshots it once at accept time.
-	state atomic.Pointer[serviceState]
-
-	// l7handler is nil for TCP services; non-nil for HTTP/HTTPS.
-	// Immutable: protocol cannot change without restarting the instance.
+	cfg       config.ServiceConfig
+	state     atomic.Pointer[serviceState]
 	l7handler *proxy.HTTPConnHandler
 
 	frameSize int64
+	psk       string // PSK for tunnel auth
 	logger    *slog.Logger
 
-	listener net.Listener
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	listener  net.Listener
+	cancel    context.CancelFunc
+	proberCtx context.Context // context used by prober goroutines
+	wg        sync.WaitGroup
 }
 
-// newServiceInstance constructs a serviceInstance from a ServiceConfig.
-// It does not bind the port yet; call start() for that.
-func newServiceInstance(svc config.ServiceConfig, frameSize int64, logger *slog.Logger) (*serviceInstance, error) {
+func newServiceInstance(svc config.ServiceConfig, frameSize int64, psk string, logger *slog.Logger) (*serviceInstance, error) {
 	hops := svc.SortedHops()
 	if len(hops) == 0 {
 		return nil, fmt.Errorf("service %q: no hops configured", svc.ID)
@@ -70,11 +49,12 @@ func newServiceInstance(svc config.ServiceConfig, frameSize int64, logger *slog.
 	inst := &serviceInstance{
 		cfg:       svc,
 		frameSize: frameSize,
+		psk:       psk,
 		logger:    logger.With("service", svc.ID, "port", svc.Port),
 	}
 
 	inst.state.Store(&serviceState{
-		dialer:    tunnel.NewDialer(tunnel.NewHopPool(hops, nil, logger), frameSize, logger),
+		dialer:    tunnel.NewDialer(tunnel.NewHopPool(hops, nil, logger), frameSize, psk, logger),
 		targetIDC: svc.TargetIDC,
 	})
 
@@ -85,7 +65,6 @@ func newServiceInstance(svc config.ServiceConfig, frameSize int64, logger *slog.
 	return inst, nil
 }
 
-// start binds the TCP port and launches the accept loop.
 func (inst *serviceInstance) start() error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", inst.cfg.Port))
 	if err != nil {
@@ -96,6 +75,11 @@ func (inst *serviceInstance) start() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	inst.cancel = cancel
+	inst.proberCtx = ctx
+
+	// Activate background health probing for this service's endpoints.
+	state := inst.state.Load()
+	state.dialer.Pool().StartProber(ctx, defaultProbeInterval)
 
 	inst.logger.Info("service started",
 		"protocol", inst.cfg.Protocol,
@@ -107,7 +91,7 @@ func (inst *serviceInstance) start() error {
 	return nil
 }
 
-// stop closes the listener and waits for all in-flight connections to finish.
+// stop closes the listener and waits for in-flight connections with a timeout.
 func (inst *serviceInstance) stop() {
 	if inst.cancel != nil {
 		inst.cancel()
@@ -115,26 +99,41 @@ func (inst *serviceInstance) stop() {
 	if inst.listener != nil {
 		inst.listener.Close()
 	}
-	inst.wg.Wait()
+
+	// Wait with timeout — prevents long-lived connections from blocking shutdown.
+	done := make(chan struct{})
+	go func() {
+		inst.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		// All connections drained cleanly.
+	case <-time.After(shutdownTimeout):
+		inst.logger.Warn("service shutdown timeout, some connections may not have drained",
+			"timeout", shutdownTimeout)
+	}
 	inst.logger.Info("service stopped")
 }
 
-// reloadGroups replaces the routing state atomically.
-// In-flight connections keep the old state; new connections pick up the new one.
 func (inst *serviceInstance) reloadGroups(groups []config.RouteGroup) {
 	hops := config.SortGroups(groups)
 	if len(hops) == 0 {
 		inst.logger.Warn("reload: no hops in new groups, keeping current state")
 		return
 	}
+	pool := tunnel.NewHopPool(hops, nil, inst.logger)
+	// Start prober for the new pool using the instance's context.
+	if inst.proberCtx != nil {
+		pool.StartProber(inst.proberCtx, defaultProbeInterval)
+	}
 	inst.state.Store(&serviceState{
-		dialer:    tunnel.NewDialer(tunnel.NewHopPool(hops, nil, inst.logger), inst.frameSize, inst.logger),
+		dialer:    tunnel.NewDialer(pool, inst.frameSize, inst.psk, inst.logger),
 		targetIDC: inst.cfg.TargetIDC,
 	})
 	inst.logger.Info("service routes reloaded", "hops", len(hops))
 }
 
-// acceptLoop runs in its own goroutine for the lifetime of the instance.
 func (inst *serviceInstance) acceptLoop(ctx context.Context) {
 	defer inst.wg.Done()
 	for {
@@ -156,17 +155,12 @@ func (inst *serviceInstance) acceptLoop(ctx context.Context) {
 	}
 }
 
-// handleConn processes one inbound client connection.
 func (inst *serviceInstance) handleConn(conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
 	}()
 
 	clientAddr, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-
-	// Snapshot routing state once. A concurrent reloadGroups() may replace
-	// the pointer, but this connection uses the state it observed at accept
-	// time for its full lifetime.
 	state := inst.state.Load()
 
 	inst.logger.Info("new connection",
@@ -193,6 +187,9 @@ func (inst *serviceInstance) handleConn(conn net.Conn) {
 
 	defer func() {
 		_ = tun.Close()
+		if e := recover(); e != nil {
+			inst.logger.Error("handler panic", "remote", conn.RemoteAddr(), "panic", e)
+		}
 	}()
 
 	switch inst.cfg.Protocol {
@@ -205,42 +202,35 @@ func (inst *serviceInstance) handleConn(conn net.Conn) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AccessNode
-//
-// Manages a map of serviceInstances, one per service ID.
-//
-// Reload diff semantics:
-//   added   — new ServiceConfig not present in current map → start new instance
-//   removed — running instance whose ID is absent from new config → stop
-//   updated — same ID present in both → hot-reload groups only
-//             (port/protocol changes are ignored; they require a restart)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// AccessNode is the client-facing edge of the proxy pipeline.
 type AccessNode struct {
 	frameSize int64
+	psk       string // PSK passed to dialers
 	logger    *slog.Logger
 
 	mu       sync.Mutex
-	services map[string]*serviceInstance // keyed by service ID
+	services map[string]*serviceInstance
 }
 
 var _ Node = (*AccessNode)(nil)
 
-// NewAccessNode constructs an AccessNode from its dedicated role config.
-// Service instances are created but not started; call Start() to bind ports.
-func NewAccessNode(cfg *config.AccessConfig, logger *slog.Logger) (*AccessNode, error) {
+// NewAccessNode constructs an AccessNode. psk is the pre-shared key for
+// tunnel authentication (empty = disabled).
+func NewAccessNode(cfg *config.AccessConfig, psk string, logger *slog.Logger) (*AccessNode, error) {
 	frameSize := cfg.MaxFrameSize
 	if frameSize == 0 {
 		frameSize = 64 * 1024
 	}
 	n := &AccessNode{
 		frameSize: frameSize,
+		psk:       psk,
 		logger:    logger,
 		services:  make(map[string]*serviceInstance),
 	}
 
 	for _, svc := range cfg.Services {
-		inst, err := newServiceInstance(svc, n.frameSize, logger)
+		inst, err := newServiceInstance(svc, n.frameSize, psk, logger)
 		if err != nil {
 			return nil, err
 		}
@@ -249,9 +239,6 @@ func NewAccessNode(cfg *config.AccessConfig, logger *slog.Logger) (*AccessNode, 
 	return n, nil
 }
 
-// Start binds all service ports and begins accepting connections.
-// If any port fails to bind, already-started services are stopped before
-// returning the error.
 func (n *AccessNode) Start() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -269,7 +256,6 @@ func (n *AccessNode) Start() error {
 	return nil
 }
 
-// Stop shuts down all service instances and waits for in-flight connections.
 func (n *AccessNode) Stop() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -279,25 +265,16 @@ func (n *AccessNode) Stop() {
 	}
 }
 
-// Reload applies the diff between the running services and the new config:
-//
-//   - New services (in AccessServices, not currently running) are started.
-//   - Removed services (running, absent from AccessServices) are stopped.
-//   - Existing services have their Groups hot-reloaded from rc.Groups.
-//
-// Immutable fields (port, protocol) are not changed; a mismatch is logged
-// as a warning and the running instance is kept as-is.
 func (n *AccessNode) Reload(rc ReloadableConfig) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// Build lookup set of incoming service IDs.
 	incoming := make(map[string]config.ServiceConfig, len(rc.AccessServices))
 	for _, svc := range rc.AccessServices {
 		incoming[svc.ID] = svc
 	}
 
-	// ── 1. Stop removed services ──────────────────────────────────────────
+	// Stop removed services.
 	for id, inst := range n.services {
 		if _, exists := incoming[id]; !exists {
 			n.logger.Info("access reload: stopping removed service", "service", id)
@@ -306,10 +283,9 @@ func (n *AccessNode) Reload(rc ReloadableConfig) error {
 		}
 	}
 
-	// ── 2. Update existing / start new services ───────────────────────────
+	// Update existing / start new services.
 	for id, svc := range incoming {
 		if inst, running := n.services[id]; running {
-			// Warn if immutable fields changed; can't apply without restart.
 			if inst.cfg.Port != svc.Port {
 				n.logger.Warn("access reload: port change requires restart, ignored",
 					"service", id, "old", inst.cfg.Port, "new", svc.Port)
@@ -318,14 +294,12 @@ func (n *AccessNode) Reload(rc ReloadableConfig) error {
 				n.logger.Warn("access reload: protocol change requires restart, ignored",
 					"service", id, "old", inst.cfg.Protocol, "new", svc.Protocol)
 			}
-			// Hot-reload the routing groups.
 			if groups, ok := rc.Groups[id]; ok {
 				inst.reloadGroups(groups)
 			}
 		} else {
-			// New service: construct and start a fresh instance.
 			n.logger.Info("access reload: starting new service", "service", id)
-			inst, err := newServiceInstance(svc, n.frameSize, n.logger)
+			inst, err := newServiceInstance(svc, n.frameSize, n.psk, n.logger)
 			if err != nil {
 				n.logger.Error("access reload: failed to create new service",
 					"service", id, "err", err)

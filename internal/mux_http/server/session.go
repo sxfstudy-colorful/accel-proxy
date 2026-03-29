@@ -13,22 +13,24 @@ import (
 )
 
 const (
-	// defaultSendWindow: max unacknowledged bytes per (edge, stream) pair
-	// before the sender goroutine pauses.
 	defaultSendWindow = 8 * 1024 * 1024 // 8 MiB
-
-	// pingInterval / pingTimeout control the server-side keepalive.
-	pingInterval = 20 * time.Second
-	pingTimeout  = 15 * time.Second
+	pingInterval      = 20 * time.Second
+	pingTimeout       = 15 * time.Second
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
 // streamSendState — flow-control bookkeeping for one stream → one edge
+//
+// sendOffset is atomic because it is written by the sender goroutine and
+// read by inflight() which may be called from waitWindow in the same goroutine.
+// Although currently single-writer, making it atomic eliminates the data race
+// that the race detector would flag and is future-proof against callers from
+// other goroutines (e.g. monitoring/metrics).
 // ─────────────────────────────────────────────────────────────────────────────
 
 type streamSendState struct {
 	entry       *StreamEntry
-	sendOffset  int64        // bytes written to wire for this edge
+	sendOffset  atomic.Int64 // bytes written to wire for this edge
 	ackedOffset atomic.Int64 // bytes the edge has confirmed received
 	window      int64        // max allowed (sendOffset - ackedOffset)
 
@@ -45,11 +47,9 @@ func newStreamSendState(entry *StreamEntry) *streamSendState {
 }
 
 func (s *streamSendState) inflight() int64 {
-	return s.sendOffset - s.ackedOffset.Load()
+	return s.sendOffset.Load() - s.ackedOffset.Load()
 }
 
-// waitWindow blocks until send-window credit is available, ctx is done, or
-// the state has been evicted.
 func (s *streamSendState) waitWindow(ctx context.Context) error {
 	quit := make(chan struct{})
 	go func() {
@@ -104,11 +104,6 @@ func (s *streamSendState) evict() {
 // EdgeSession — one long-lived connection from an edge node
 // ─────────────────────────────────────────────────────────────────────────────
 
-// EdgeSession manages one TCP connection from an edge node.
-// It owns:
-//   - a read loop (readLoop) that processes ACK/PING frames from the edge
-//   - one sender goroutine per subscribed stream (startSender)
-//   - a keepalive goroutine (pingLoop)
 type EdgeSession struct {
 	nodeID string
 	conn   *muxproto.MuxConn
@@ -119,7 +114,7 @@ type EdgeSession struct {
 	cancel context.CancelFunc
 
 	mu      sync.Mutex
-	streams map[uint32]*streamSendState // stream ID → send state
+	streams map[uint32]*streamSendState
 
 	once sync.Once
 }
@@ -142,7 +137,6 @@ func newEdgeSession(
 	}
 }
 
-// closeWithReason tears down the session idempotently.
 func (s *EdgeSession) closeWithReason(reason string) {
 	s.once.Do(func() {
 		s.logger.Info("closing edge session", "reason", reason)
@@ -156,8 +150,6 @@ func (s *EdgeSession) closeWithReason(reason string) {
 	})
 }
 
-// addStream registers a stream to be pushed to this edge.
-// Returns the (possibly pre-existing) send state.
 func (s *EdgeSession) addStream(entry *StreamEntry) *streamSendState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -172,7 +164,7 @@ func (s *EdgeSession) addStream(entry *StreamEntry) *streamSendState {
 // startSender launches a goroutine that reads from the StreamBuffer starting
 // at resumeOffset and writes DATA frames to the edge connection.
 func (s *EdgeSession) startSender(st *streamSendState, resumeOffset int64) {
-	st.sendOffset = resumeOffset
+	st.sendOffset.Store(resumeOffset)
 	st.ackedOffset.Store(resumeOffset)
 
 	go func() {
@@ -181,20 +173,17 @@ func (s *EdgeSession) startSender(st *streamSendState, resumeOffset int64) {
 		entry := st.entry
 
 		for {
-			// Wait for data to exist at current offset.
 			entry.Buffer.WaitForData(s.ctx, offset)
 			if s.ctx.Err() != nil {
 				return
 			}
 
-			// Apply flow-control: pause when inflight ≥ window.
 			if err := st.waitWindow(s.ctx); err != nil {
 				return
 			}
 
 			n, err := entry.Buffer.Read(offset, buf)
 			if err == io.EOF {
-				// Stream finished: send RST(EOF) so the edge knows.
 				s.conn.WriteFrame(&muxproto.Frame{ //nolint:errcheck
 					StreamID: entry.ID,
 					Type:     muxproto.TypeRST,
@@ -208,7 +197,6 @@ func (s *EdgeSession) startSender(st *streamSendState, resumeOffset int64) {
 				return
 			}
 			if n == 0 {
-				// No data yet (race between WaitForData and Read); retry.
 				continue
 			}
 
@@ -220,17 +208,15 @@ func (s *EdgeSession) startSender(st *streamSendState, resumeOffset int64) {
 				s.closeWithReason(fmt.Sprintf("write DATA: %v", err))
 				return
 			}
-			st.sendOffset += int64(n)
+			st.sendOffset.Add(int64(n))
 			offset += int64(n)
 		}
 	}()
 }
 
 // readLoop processes inbound frames from the edge until the connection closes
-// or the session is cancelled.  Blocking; call from the connection goroutine.
+// or the session is cancelled.
 func (s *EdgeSession) readLoop() {
-	// pingLoop runs independently so that ReadFrame (which blocks) does not
-	// prevent us from sending pings.
 	go s.pingLoop()
 	defer s.closeWithReason("read loop exited")
 
@@ -258,7 +244,6 @@ func (s *EdgeSession) readLoop() {
 			s.broker.onAck(s.nodeID, msg.StreamID, msg.Offset)
 
 		case muxproto.TypePong:
-			// Keepalive acknowledged; pingLoop tracks the timestamp.
 			s.broker.onPong(s.nodeID)
 
 		case muxproto.TypePing:
@@ -270,14 +255,11 @@ func (s *EdgeSession) readLoop() {
 	}
 }
 
-// pingLoop sends periodic PING frames and closes the session if no PONG is
-// received within pingTimeout.
 func (s *EdgeSession) pingLoop() {
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 
 	lastPong := time.Now()
-	// Register a callback so readLoop can update lastPong.
 	pongCh := s.broker.registerPongCh(s.nodeID)
 	defer s.broker.unregisterPongCh(s.nodeID)
 

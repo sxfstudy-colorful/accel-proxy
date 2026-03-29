@@ -21,8 +21,8 @@ import (
 
 const (
 	FrameHeaderSize = 9
-	MaxPayloadSize  = 8 * 1024 * 1024  // 8 MiB hard cap per frame
-	DataChunkSize   = 32 * 1024        // 32 KiB default DATA frame size
+	MaxPayloadSize  = 8 * 1024 * 1024 // 8 MiB hard cap per frame
+	DataChunkSize   = 32 * 1024       // 32 KiB default DATA frame size
 	ControlStreamID = uint32(0)
 )
 
@@ -52,7 +52,13 @@ type Frame struct {
 }
 
 // WriteTo serialises the frame into w.
+// Returns an error if the payload exceeds MaxPayloadSize (defense-in-depth:
+// prevents a bug on the sending side from wasting bandwidth on frames that
+// the receiver will reject anyway).
 func (f *Frame) WriteTo(w io.Writer) error {
+	if len(f.Payload) > MaxPayloadSize {
+		return fmt.Errorf("frame payload too large to write: %d > %d", len(f.Payload), MaxPayloadSize)
+	}
 	var hdr [FrameHeaderSize]byte
 	binary.BigEndian.PutUint32(hdr[0:4], f.StreamID)
 	hdr[4] = byte(f.Type)
@@ -74,8 +80,8 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 		return nil, err
 	}
 	streamID := binary.BigEndian.Uint32(hdr[0:4])
-	typ      := FrameType(hdr[4])
-	length   := binary.BigEndian.Uint32(hdr[5:9])
+	typ := FrameType(hdr[4])
+	length := binary.BigEndian.Uint32(hdr[5:9])
 
 	if length > MaxPayloadSize {
 		return nil, fmt.Errorf("frame payload too large: %d > %d", length, MaxPayloadSize)
@@ -93,37 +99,28 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 // Control message payloads (JSON, only on stream_id == 0)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// RegisterMsg is the TypeRegister payload sent by the edge on connect.
 type RegisterMsg struct {
 	NodeID string           `json:"node_id"`
-	Subs   []string         `json:"subs"`             // stream names to subscribe
-	Resume map[string]int64 `json:"resume,omitempty"` // stream name → resume byte offset
+	Subs   []string         `json:"subs"`
+	Resume map[string]int64 `json:"resume,omitempty"`
 }
 
-// RegisterAckMsg is the TypeRegisterAck payload sent by the server.
-// StreamIDs maps each confirmed stream name to the uint32 ID used in DATA frames.
 type RegisterAckMsg struct {
 	OK        bool              `json:"ok"`
 	Message   string            `json:"message,omitempty"`
-	StreamIDs map[string]uint32 `json:"stream_ids"` // name → uint32 id
+	StreamIDs map[string]uint32 `json:"stream_ids"`
 }
 
-// AckMsg is the TypeAck payload; edge confirms it has consumed up to Offset
-// bytes for the given stream.
 type AckMsg struct {
 	StreamID uint32 `json:"sid"`
 	Offset   int64  `json:"off"`
 }
 
-// WindowUpdateMsg is the TypeWindowUpdate payload sent by the server to
-// inform the edge of the server's current send window for a stream.
-// (Currently unused in the flow-control path — kept for future use.)
 type WindowUpdateMsg struct {
 	StreamID uint32 `json:"sid"`
 	Window   int64  `json:"window"`
 }
 
-// RSTMsg is the TypeRST payload.
 type RSTMsg struct {
 	StreamID uint32 `json:"sid"`
 	Reason   string `json:"reason"`

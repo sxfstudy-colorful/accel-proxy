@@ -26,12 +26,28 @@ const (
 )
 
 // streamRecvState holds the per-stream receive state on the client side.
+//
+// recvOffset and ackedOffset are atomic.Int64 to eliminate the data race
+// between readLoop (writes recvOffset) and ackLoop (reads both, writes
+// ackedOffset).
 type streamRecvState struct {
 	name        string
-	id          uint32 // stream ID assigned by server in REGISTER_ACK
-	recvOffset  int64  // total bytes received so far (= resume offset on reconnect)
-	ackedOffset int64  // last offset we reported back to the server
+	id          uint32
+	recvOffset  atomic.Int64 // total bytes received (= resume offset on reconnect)
+	ackedOffset atomic.Int64 // last offset reported to server
 	buf         *RecvBuffer
+}
+
+// streamReaderWrapper implements io.Reader by forwarding to the current
+// RecvBuffer of a streamRecvState. Because the underlying buf pointer never
+// changes (we use Reopen instead of replacing the buf), this wrapper is
+// technically unnecessary — but it keeps the public API clean and future-proof.
+type streamReaderWrapper struct {
+	st *streamRecvState
+}
+
+func (w *streamReaderWrapper) Read(p []byte) (int, error) {
+	return w.st.buf.Read(p)
 }
 
 // EdgeClientSession manages the long-lived connection from an edge node to
@@ -46,17 +62,16 @@ type EdgeClientSession struct {
 	subs       []string
 	logger     *slog.Logger
 
-	// streams is keyed by stream name; populated in NewEdgeClientSession.
-	streams map[string]*streamRecvState
-
-	// streamsByID is rebuilt on every connect (server assigns fresh IDs on each
-	// REGISTER_ACK after a reconnect if a stream was recreated server-side).
+	streams     map[string]*streamRecvState
 	streamsByID map[uint32]*streamRecvState
 	idMu        sync.RWMutex
 
-	// conn is the current active MuxConn; replaced on reconnect.
 	conn   *muxproto.MuxConn
 	connMu sync.Mutex
+
+	// pongCh carries pong signals from readLoop to pingLoop.
+	// Recreated on each runOnce cycle.
+	pongCh chan struct{}
 
 	closed atomic.Bool
 	ctx    context.Context
@@ -100,11 +115,15 @@ func (s *EdgeClientSession) Close() {
 }
 
 // StreamReader returns an io.Reader for the named stream.
-// The reader blocks until data is available or the stream is closed.
+// The reader follows the underlying RecvBuffer across reconnects — if the
+// network drops and the session reconnects, new data continues to flow through
+// the same reader without the consumer seeing any interruption (unless the
+// server sends a clean RST/EOF).
+//
 // Returns nil if the name was not in the subscription list.
 func (s *EdgeClientSession) StreamReader(name string) io.Reader {
 	if st, ok := s.streams[name]; ok {
-		return st.buf
+		return &streamReaderWrapper{st: st}
 	}
 	return nil
 }
@@ -112,13 +131,13 @@ func (s *EdgeClientSession) StreamReader(name string) io.Reader {
 // ResumeOffset returns the byte offset the named stream has received so far.
 func (s *EdgeClientSession) ResumeOffset(name string) int64 {
 	if st, ok := s.streams[name]; ok {
-		return st.recvOffset
+		return st.recvOffset.Load()
 	}
 	return 0
 }
 
 // Run connects, registers, and reconnects with exponential back-off until
-// Close() is called.  Blocks until Close() is called.
+// Close() is called.
 func (s *EdgeClientSession) Run() {
 	backoff := reconnectBase
 	for !s.closed.Load() {
@@ -142,10 +161,27 @@ func (s *EdgeClientSession) Run() {
 	}
 }
 
-// runOnce performs one connect→register→receive cycle.
-// Returns nil only if Close() was called; otherwise returns the error that
-// caused the disconnect.
 func (s *EdgeClientSession) runOnce() error {
+	// ── Reopen any closed RecvBuffers before reconnecting ────────────────
+	// After a network disconnect the previous cycle may have closed some
+	// buffers (e.g. via handleRST with a non-EOF reason or session teardown).
+	// Reopen them so that Write can resume on the same buffer instance.
+	// This keeps the consumer's io.Reader reference valid — they just see a
+	// brief stall, then data resumes.
+	//
+	// Note: buffers closed by a clean RST(EOF) should NOT be reopened — the
+	// stream is genuinely finished. However, distinguishing "network error
+	// close" from "clean EOF close" would require extra state. The current
+	// approach reopens all closed buffers on reconnect; if the server has
+	// truly finished the stream, it will send RST(EOF) again and the buffer
+	// will be cleanly closed once more.
+	for _, st := range s.streams {
+		if st.buf.IsClosed() {
+			st.buf.Reopen()
+			s.logger.Debug("reopened recv buffer for reconnect", "stream", st.name)
+		}
+	}
+
 	conn, err := net.DialTimeout("tcp", s.accessAddr, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", s.accessAddr, err)
@@ -168,8 +204,9 @@ func (s *EdgeClientSession) runOnce() error {
 	// 1. Send REGISTER with resume offsets.
 	resume := make(map[string]int64)
 	for name, st := range s.streams {
-		if st.recvOffset > 0 {
-			resume[name] = st.recvOffset
+		off := st.recvOffset.Load()
+		if off > 0 {
+			resume[name] = off
 		}
 	}
 	regPayload := muxproto.Marshal(muxproto.RegisterMsg{
@@ -220,9 +257,11 @@ func (s *EdgeClientSession) runOnce() error {
 	go s.ackLoop(mc, ackStop)
 	defer close(ackStop)
 
-	// 4. Start keepalive goroutine.
+	// 4. Create pongCh and start keepalive goroutine.
+	pongCh := make(chan struct{}, 4)
+	s.pongCh = pongCh
 	pingStop := make(chan struct{})
-	go s.pingLoop(mc, pingStop)
+	go s.pingLoop(mc, pingStop, pongCh)
 	defer close(pingStop)
 
 	// 5. Read loop (blocks until connection dies or ctx cancelled).
@@ -238,7 +277,7 @@ func (s *EdgeClientSession) readLoop(mc *muxproto.MuxConn) error {
 		f, err := mc.ReadFrame()
 		if err != nil {
 			if s.ctx.Err() != nil {
-				return nil // closed intentionally
+				return nil
 			}
 			return fmt.Errorf("read frame: %w", err)
 		}
@@ -254,7 +293,10 @@ func (s *EdgeClientSession) readLoop(mc *muxproto.MuxConn) error {
 		case muxproto.TypePing:
 			mc.WriteFrame(&muxproto.Frame{Type: muxproto.TypePong}) //nolint:errcheck
 		case muxproto.TypePong:
-			// handled by pingLoop via the pongCh
+			select {
+			case s.pongCh <- struct{}{}:
+			default:
+			}
 		default:
 			s.logger.Debug("unexpected frame type", "type", f.Type)
 		}
@@ -274,9 +316,9 @@ func (s *EdgeClientSession) handleData(f *muxproto.Frame) {
 		s.logger.Warn("recv buffer write error", "stream", st.name, "err", err)
 		return
 	}
-	st.recvOffset += int64(len(f.Payload))
+	st.recvOffset.Add(int64(len(f.Payload)))
 
-	if st.recvOffset-st.ackedOffset >= ackEveryBytes {
+	if st.recvOffset.Load()-st.ackedOffset.Load() >= ackEveryBytes {
 		s.sendAck(st)
 	}
 }
@@ -298,8 +340,7 @@ func (s *EdgeClientSession) handleRST(msg muxproto.RSTMsg) {
 }
 
 // pingLoop sends PING frames periodically and closes the connection on timeout.
-// Uses a pong channel that readLoop signals via sendPong.
-func (s *EdgeClientSession) pingLoop(mc *muxproto.MuxConn, stop <-chan struct{}) {
+func (s *EdgeClientSession) pingLoop(mc *muxproto.MuxConn, stop <-chan struct{}, pongCh <-chan struct{}) {
 	ticker := time.NewTicker(clientPingInterval)
 	defer ticker.Stop()
 	lastPong := time.Now()
@@ -310,6 +351,8 @@ func (s *EdgeClientSession) pingLoop(mc *muxproto.MuxConn, stop <-chan struct{})
 			return
 		case <-s.ctx.Done():
 			return
+		case <-pongCh:
+			lastPong = time.Now()
 		case <-ticker.C:
 			if time.Since(lastPong) > clientPingInterval+clientPingTimeout {
 				s.logger.Warn("ping timeout, closing connection")
@@ -339,7 +382,7 @@ func (s *EdgeClientSession) ackLoop(mc *muxproto.MuxConn, stop <-chan struct{}) 
 			}
 			s.idMu.RUnlock()
 			for _, st := range sts {
-				if st.recvOffset > st.ackedOffset {
+				if st.recvOffset.Load() > st.ackedOffset.Load() {
 					s.sendAckWithConn(mc, st)
 				}
 			}
@@ -357,11 +400,11 @@ func (s *EdgeClientSession) sendAck(st *streamRecvState) {
 }
 
 func (s *EdgeClientSession) sendAckWithConn(mc *muxproto.MuxConn, st *streamRecvState) {
-	offset := st.recvOffset
+	offset := st.recvOffset.Load()
 	mc.WriteFrame(&muxproto.Frame{ //nolint:errcheck
 		StreamID: muxproto.ControlStreamID,
 		Type:     muxproto.TypeAck,
 		Payload:  muxproto.Marshal(muxproto.AckMsg{StreamID: st.id, Offset: offset}),
 	})
-	st.ackedOffset = offset
+	st.ackedOffset.Store(offset)
 }

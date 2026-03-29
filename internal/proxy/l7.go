@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sxfstudy-colorful/accel-proxy/internal/config"
+	"github.com/sxfstudy-colorful/accel-proxy/internal/netutil"
 	"github.com/sxfstudy-colorful/accel-proxy/internal/tunnel"
 )
 
@@ -23,13 +24,10 @@ type HTTPConnHandler struct {
 	logger *slog.Logger
 }
 
-// NewHTTPConnHandler creates an HTTPConnHandler for the given service.
 func NewHTTPConnHandler(svc config.ServiceConfig, logger *slog.Logger) *HTTPConnHandler {
 	return &HTTPConnHandler{svc: svc, logger: logger}
 }
 
-// Handle processes a single client connection through the given tunnel.
-// tunnelConn must be a *tunnel.Transport — the dead-flag contract depends on it.
 func (h *HTTPConnHandler) Handle(clientConn net.Conn, tunnelConn *tunnel.Transport) {
 	clientIPStr := remoteIP(clientConn)
 	clientBR := bufio.NewReaderSize(clientConn, 64*1024)
@@ -141,9 +139,6 @@ func (h *HTTPConnHandler) handleConnect(
 		writeHTTPError(clientConn, http.StatusBadGateway, "bad gateway", h.logger)
 		return
 	}
-	// Always drain up to connectBodyDrainLimit bytes and close resp.Body:
-	//   - non-200: releases the body reader on tunnelBR (防止残留字节污染后续读取)
-	//   - 200:     resp.Body is eofReader, so drain and Close are both no-ops
 	defer func() {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
@@ -203,11 +198,11 @@ func (h *HTTPConnHandler) handleHTTP(
 		return false
 	}
 
-	if strings.EqualFold(req.Header.Get("Connection"), "close") {
+	// FIX: use connectionHasClose for multi-value Connection header parsing.
+	if connectionHasClose(req.Header) {
 		return false
 	}
-
-	if strings.EqualFold(resp.Header.Get("Connection"), "close") {
+	if connectionHasClose(resp.Header) {
 		return false
 	}
 	return req.ProtoAtLeast(1, 1)
@@ -241,8 +236,11 @@ func (h *HTTPConnHandler) mutateRequest(req *http.Request, clientIPStr string) {
 		req.Header.Set(k, v)
 	}
 
-	if svc.HTTP.RewriteHost {
-		req.Host = fmt.Sprintf("%s:%d", svc.Origin.Host, svc.Origin.Port)
+	// FIX: use RewriteHostValue instead of Origin.Host:Port.
+	// Origin is only configured on egress nodes; on access nodes it is zero-valued,
+	// which would produce ":0". RewriteHostValue is explicitly set in the config.
+	if svc.HTTP.RewriteHost && svc.HTTP.RewriteHostValue != "" {
+		req.Host = svc.HTTP.RewriteHostValue
 	}
 
 	if req.URL.Host == "" {
@@ -263,34 +261,23 @@ func (h *HTTPConnHandler) mutateRequest(req *http.Request, clientIPStr string) {
 	}
 }
 
+// hopByHopHeaders lists headers that must not be forwarded by proxies.
+// Transfer-Encoding is intentionally excluded — Go's http.Request.Write
+// handles chunked encoding automatically.
 var hopByHopHeaders = []string{
 	"Connection", "Keep-Alive", "Proxy-Authenticate",
-	"Proxy-Authorization", "TE", "Trailers", "Transfer-Encoding",
+	"Proxy-Authorization", "TE", "Trailers",
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bidirectional raw relay (bufio-aware)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// relayBuffered copies bytes between a net.Conn and a tunnel Transport
-// without duplication.
-//
-// b must be a *tunnel.Transport so the dead-flag contract is enforced:
-// if the a→b direction fails, b is poisoned (dead=true) before Close,
-// which causes b→a's io.CopyBuffer(a, b) to see EOF from the pipe and
-// exit cleanly rather than racing on a half-closed Transport.
-//
-// Safety ordering:
-//  1. Flush phase  (serial)     — drain bufio residuals into the peer.
-//  2. Relay phase  (concurrent) — one goroutine per direction, no shared
-//     read state, Transport.dead enforces
-//     no-retry on write failure.
 func relayBuffered(
 	a net.Conn, aBR *bufio.Reader,
 	b *tunnel.Transport, bBR *bufio.Reader,
 	logger *slog.Logger,
 ) {
-	// ── Phase 1: flush bufio residuals (serial) ───────────────────────────
 	if err := flushBufio(bBR, a); err != nil {
 		logger.Debug("relay flush b→a", "err", err)
 		return
@@ -300,11 +287,8 @@ func relayBuffered(
 		return
 	}
 
-	// ── Phase 2: raw bidirectional relay (concurrent) ─────────────────────
 	done := make(chan struct{}, 2)
 
-	// a → b: when this fails, b.Close() poisons b.dead=true, which makes
-	// the b→a goroutine's Read(b) return EOF via the closed io.Pipe.
 	go func() {
 		defer func() { _ = b.Close(); done <- struct{}{} }()
 		buf := make([]byte, 32*1024)
@@ -314,8 +298,6 @@ func relayBuffered(
 		}
 	}()
 
-	// b → a: Read(b) drains the io.Pipe; when the pipe is closed by
-	// b.Close() above, Read returns EOF and this goroutine exits.
 	go func() {
 		defer func() { _ = a.Close(); done <- struct{}{} }()
 		buf := make([]byte, 32*1024)
@@ -328,18 +310,12 @@ func relayBuffered(
 	<-done
 }
 
-// flushBufio drains any bytes buffered in br and writes them to dst.
-// br may be nil (no-op). Returns an error only if the write to dst fails —
-// a partial flush that leaves dst in an inconsistent state is always fatal.
 func flushBufio(br *bufio.Reader, dst io.Writer) error {
 	if br == nil || br.Buffered() == 0 {
 		return nil
 	}
 	drained := make([]byte, br.Buffered())
-	// br.Read into a same-size buffer is guaranteed to succeed and return
-	// exactly br.Buffered() bytes — it never blocks or returns io.EOF here.
 	if _, err := br.Read(drained); err != nil {
-		// Should be unreachable: bufio.Reader.Read on buffered data never errors.
 		return fmt.Errorf("bufio drain read: %w", err)
 	}
 	if _, err := dst.Write(drained); err != nil {
@@ -357,6 +333,20 @@ func isWebSocketUpgrade(req *http.Request) bool {
 		strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade")
 }
 
+// connectionHasClose checks whether the Connection header contains the "close"
+// token. The header value may be a comma-separated list of tokens, e.g.
+// "close, X-Custom" or "keep-alive".
+func connectionHasClose(header http.Header) bool {
+	for _, v := range header["Connection"] {
+		for _, token := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "close") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func remoteIP(conn net.Conn) string {
 	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 	if err != nil {
@@ -366,16 +356,9 @@ func remoteIP(conn net.Conn) string {
 }
 
 func isClosedConn(err error) bool {
-	if err == nil || errors.Is(err, io.EOF) {
-		return true
-	}
-	s := err.Error()
-	return strings.Contains(s, "use of closed network connection") ||
-		strings.Contains(s, "connection reset by peer") ||
-		strings.Contains(s, "broken pipe")
+	return netutil.IsExpectedCloseErr(err)
 }
 
-// writeHTTPError sends a minimal HTTP error response and logs write failures.
 func writeHTTPError(conn net.Conn, code int, msg string, logger *slog.Logger) {
 	if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		logger.Debug("writeHTTPError: set deadline", "err", err)
@@ -389,13 +372,4 @@ func writeHTTPError(conn net.Conn, code int, msg string, logger *slog.Logger) {
 	if _, err := conn.Write(buf.Bytes()); err != nil && !isClosedConn(err) {
 		logger.Debug("writeHTTPError: write", "code", code, "err", err)
 	}
-}
-
-// clientIP kept for l4.go compat.
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

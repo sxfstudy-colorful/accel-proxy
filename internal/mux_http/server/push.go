@@ -17,23 +17,22 @@ const (
 	evictLagThreshold = int64(bufferMaxRetain) * 8 / 10 // 80%
 )
 
-// PushBroker is the central coordinator:
-//   - accepts edge node connections and drives their sessions
-//   - accepts origin push requests and writes into stream buffers
-//   - tracks ACKs, trims buffers, and evicts slow edges
+// PushBroker is the central coordinator.
 type PushBroker struct {
 	logger  *slog.Logger
 	nodes   *NodeRegistry
 	subs    *SubscriptionTable
 	streams *StreamRegistry
 
-	// ackTable: latest acked offset per (nodeID, streamID)
 	ackMu    sync.Mutex
 	ackTable map[ackKey]int64
 
-	// pongTable: per-nodeID channel used by pingLoop to receive pong timestamps
 	pongMu    sync.Mutex
 	pongTable map[string]chan time.Time
+
+	// FIX: lifecycle management — trimLoop stops when ctx is cancelled.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type ackKey struct {
@@ -42,6 +41,7 @@ type ackKey struct {
 }
 
 func NewPushBroker(logger *slog.Logger) *PushBroker {
+	ctx, cancel := context.WithCancel(context.Background())
 	b := &PushBroker{
 		logger:    logger,
 		nodes:     NewNodeRegistry(),
@@ -49,13 +49,20 @@ func NewPushBroker(logger *slog.Logger) *PushBroker {
 		streams:   NewStreamRegistry(bufferMaxRetain),
 		ackTable:  make(map[ackKey]int64),
 		pongTable: make(map[string]chan time.Time),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 	go b.trimLoop()
 	return b
 }
 
+// Close stops all background goroutines (trimLoop, etc.).
+func (b *PushBroker) Close() {
+	b.cancel()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Pong tracking (used by pingLoop in session.go)
+// Pong tracking
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (b *PushBroker) registerPongCh(nodeID string) <-chan time.Time {
@@ -88,13 +95,9 @@ func (b *PushBroker) onPong(nodeID string) {
 // Edge connection handling
 // ─────────────────────────────────────────────────────────────────────────────
 
-// HandleEdgeConn is called for every new TCP connection from an edge node
-// (forwarded by accel-proxy).  Performs the REGISTER handshake then drives
-// the session until the connection closes.
 func (b *PushBroker) HandleEdgeConn(conn *muxproto.MuxConn) {
 	logger := b.logger.With("remote", conn.RemoteAddr())
 
-	// 1. Expect REGISTER frame.
 	f, err := conn.ReadFrame()
 	if err != nil {
 		logger.Warn("edge: read REGISTER failed", "err", err)
@@ -116,7 +119,6 @@ func (b *PushBroker) HandleEdgeConn(conn *muxproto.MuxConn) {
 	logger = logger.With("node_id", reg.NodeID)
 	logger.Info("edge connected", "subs", reg.Subs, "resume", reg.Resume)
 
-	// 2. Create session and stream send states.
 	sess := newEdgeSession(reg.NodeID, conn, b, logger)
 
 	streamIDs := make(map[string]uint32, len(reg.Subs))
@@ -126,16 +128,14 @@ func (b *PushBroker) HandleEdgeConn(conn *muxproto.MuxConn) {
 		streamIDs[name] = entry.ID
 		b.subs.Subscribe(name, reg.NodeID)
 
-		// Apply resume offset if provided.
 		if reg.Resume != nil {
 			if off, ok := reg.Resume[name]; ok {
-				st.sendOffset = off
+				st.sendOffset.Store(off)
 				st.ackedOffset.Store(off)
 			}
 		}
 	}
 
-	// 3. Send REGISTER_ACK.
 	ackFrame := &muxproto.Frame{
 		StreamID: muxproto.ControlStreamID,
 		Type:     muxproto.TypeRegisterAck,
@@ -150,7 +150,6 @@ func (b *PushBroker) HandleEdgeConn(conn *muxproto.MuxConn) {
 		return
 	}
 
-	// 4. Register node and start per-stream sender goroutines.
 	b.nodes.Register(reg.NodeID, sess)
 
 	for _, name := range reg.Subs {
@@ -159,14 +158,12 @@ func (b *PushBroker) HandleEdgeConn(conn *muxproto.MuxConn) {
 		st := sess.streams[entry.ID]
 		sess.mu.Unlock()
 		if st != nil {
-			sess.startSender(st, st.sendOffset)
+			sess.startSender(st, st.sendOffset.Load())
 		}
 	}
 
-	// 5. Drive the read loop (blocks until connection closes).
 	sess.readLoop()
 
-	// 6. Cleanup.
 	b.nodes.Unregister(reg.NodeID, sess)
 	b.subs.Unsubscribe(reg.NodeID)
 	logger.Info("edge session closed")
@@ -176,9 +173,6 @@ func (b *PushBroker) HandleEdgeConn(conn *muxproto.MuxConn) {
 // Origin push
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Push reads from r and appends all bytes into the named stream's buffer.
-// Fan-out to subscribed edge nodes happens in real time as data is appended.
-// Blocks until r returns io.EOF or an error.
 func (b *PushBroker) Push(ctx context.Context, streamName string, r io.Reader) (int64, error) {
 	entry := b.streams.GetOrCreate(streamName)
 
@@ -209,7 +203,6 @@ func (b *PushBroker) Push(ctx context.Context, streamName string, r io.Reader) (
 	}
 }
 
-// StreamInfo returns a snapshot of stream names → write offsets.
 func (b *PushBroker) StreamInfo() map[string]int64 {
 	names := b.streams.Names()
 	out := make(map[string]int64, len(names))
@@ -221,7 +214,6 @@ func (b *PushBroker) StreamInfo() map[string]int64 {
 	return out
 }
 
-// NodeIDs returns the IDs of currently connected edge nodes.
 func (b *PushBroker) NodeIDs() []string {
 	sessions := b.nodes.All()
 	ids := make([]string, len(sessions))
@@ -243,7 +235,6 @@ func (b *PushBroker) onAck(nodeID string, streamID uint32, offset int64) {
 	}
 	b.ackMu.Unlock()
 
-	// Evict edge if it is lagging too far behind.
 	entry, err := b.streams.GetByID(streamID)
 	if err != nil {
 		return
@@ -257,11 +248,18 @@ func (b *PushBroker) onAck(nodeID string, streamID uint32, offset int64) {
 	}
 }
 
+// trimLoop runs in the background, trimming buffers and cleaning up finished
+// streams. FIX: now stoppable via ctx.
 func (b *PushBroker) trimLoop() {
 	ticker := time.NewTicker(trimInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		b.trimAll()
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-ticker.C:
+			b.trimAll()
+		}
 	}
 }
 
@@ -296,5 +294,24 @@ func (b *PushBroker) trimAll() {
 			continue
 		}
 		entry.Buffer.Trim(ma.offset)
+	}
+
+	// FIX: clean up closed streams with no subscribers.
+	for _, name := range b.streams.ClosedStreams() {
+		subscribers := b.subs.Subscribers(name)
+		if len(subscribers) == 0 {
+			entry := b.streams.Get(name)
+			if entry != nil {
+				b.ackMu.Lock()
+				for k := range b.ackTable {
+					if k.streamID == entry.ID {
+						delete(b.ackTable, k)
+					}
+				}
+				b.ackMu.Unlock()
+				b.streams.Remove(name)
+				b.logger.Debug("removed finished stream", "stream", name)
+			}
+		}
 	}
 }

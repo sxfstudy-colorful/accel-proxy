@@ -33,9 +33,6 @@ func (h *LocalHTTPServer) Run() error {
 	mux := http.NewServeMux()
 
 	// GET /stream/{name}
-	// Streams the content of the named push stream as a chunked HTTP response.
-	// The consumer reads until the server closes the connection (stream EOF)
-	// or the request is cancelled.
 	mux.HandleFunc("/stream/", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path[len("/stream/"):]
 		if path == "" {
@@ -46,7 +43,7 @@ func (h *LocalHTTPServer) Run() error {
 		// Strip optional /offset suffix.
 		if len(path) > 7 && path[len(path)-7:] == "/offset" {
 			name := path[:len(path)-7]
-			off  := h.sess.ResumeOffset(name)
+			off := h.sess.ResumeOffset(name)
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
 				"stream": name,
@@ -55,7 +52,7 @@ func (h *LocalHTTPServer) Run() error {
 			return
 		}
 
-		name   := path
+		name := path
 		reader := h.sess.StreamReader(name)
 		if reader == nil {
 			http.Error(w, fmt.Sprintf("unknown stream %q", name), http.StatusNotFound)
@@ -68,7 +65,6 @@ func (h *LocalHTTPServer) Run() error {
 		w.Header().Set("Transfer-Encoding", "chunked")
 		w.Header().Set("X-Mux-Stream", name)
 
-		// Flush headers immediately so the consumer starts receiving bytes.
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
 		}
@@ -95,7 +91,6 @@ func (h *LocalHTTPServer) Run() error {
 				h.logger.Warn("stream read error", "stream", name, "err", err)
 				return
 			}
-			// Check if client disconnected.
 			if r.Context().Err() != nil {
 				h.logger.Debug("consumer disconnected", "stream", name)
 				return

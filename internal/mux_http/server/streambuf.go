@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 
 	"github.com/sxfstudy-colorful/accel-proxy/internal/mux_http/muxproto"
@@ -17,25 +18,18 @@ type segment struct {
 }
 
 // StreamBuffer is a concurrent append-only byte store for one push stream.
-//
-// Append is called by the PushBroker (origin writer goroutine).
-// Read + WaitForData are called by EdgeSession sender goroutines (one per
-// subscribed edge node).
-//
-// Back-pressure: Append blocks when retained bytes ≥ maxRetain.
-// Trim is called periodically to free segments all subscribers have ACKed.
 type StreamBuffer struct {
 	mu   sync.Mutex
 	cond *sync.Cond
 
 	segments    []*segment
-	baseOffset  int64 // byte offset of segments[0].data[0]
-	writeOffset int64 // total bytes ever appended
+	baseOffset  int64
+	writeOffset int64
 
 	maxRetain int64
 
 	closed   bool
-	closeErr error // set to io.EOF on clean close
+	closeErr error
 }
 
 func NewStreamBuffer(maxRetain int64) *StreamBuffer {
@@ -44,8 +38,7 @@ func NewStreamBuffer(maxRetain int64) *StreamBuffer {
 	return b
 }
 
-// Append adds data to the stream.
-// Blocks when the buffer is full (back-pressures the origin reader).
+// Append adds data to the stream. Blocks when the buffer is full.
 func (b *StreamBuffer) Append(data []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -79,7 +72,7 @@ func (b *StreamBuffer) Append(data []byte) error {
 	return nil
 }
 
-// Close marks the stream finished.  Pass nil for a clean EOF.
+// Close marks the stream finished. Pass nil for a clean EOF.
 func (b *StreamBuffer) Close(closeErr error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -94,6 +87,13 @@ func (b *StreamBuffer) Close(closeErr error) {
 	b.cond.Broadcast()
 }
 
+// IsClosed reports whether the stream has been closed.
+func (b *StreamBuffer) IsClosed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.closed
+}
+
 // WriteOffset returns total bytes written so far.
 func (b *StreamBuffer) WriteOffset() int64 {
 	b.mu.Lock()
@@ -102,11 +102,7 @@ func (b *StreamBuffer) WriteOffset() int64 {
 }
 
 // Read reads up to len(buf) bytes starting at the given absolute offset.
-//
-//   - (n>0, nil)   data read successfully
-//   - (0,  nil)    no data yet at offset — call WaitForData then retry
-//   - (0,  io.EOF) stream closed cleanly and all data has been consumed
-//   - (0,  err)    origin error or muxproto.ErrOffsetEvicted
+// Uses binary search to locate the starting segment (O(log N) instead of O(N)).
 func (b *StreamBuffer) Read(offset int64, buf []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -121,13 +117,16 @@ func (b *StreamBuffer) Read(offset int64, buf []byte) (int, error) {
 		return 0, nil
 	}
 
+	// Binary search: find the first segment whose data range covers 'offset'.
+	// Each segment spans [baseOffset, baseOffset+len(data)).
+	// We want the first segment where baseOffset + len(data) > offset.
+	startIdx := sort.Search(len(b.segments), func(i int) bool {
+		return b.segments[i].baseOffset+int64(len(b.segments[i].data)) > offset
+	})
+
 	n := 0
-	for _, seg := range b.segments {
-		segEnd := seg.baseOffset + int64(len(seg.data))
-		if segEnd <= offset {
-			continue // entirely before the requested offset
-		}
-		// start within this segment
+	for i := startIdx; i < len(b.segments) && n < len(buf); i++ {
+		seg := b.segments[i]
 		start := offset + int64(n) - seg.baseOffset
 		if start < 0 {
 			start = 0
@@ -139,35 +138,25 @@ func (b *StreamBuffer) Read(offset int64, buf []byte) (int, error) {
 		}
 		copy(buf[n:], seg.data[start:end])
 		n += int(end - start)
-		if n >= len(buf) {
-			break
-		}
 	}
 	return n, nil
 }
 
-// WaitForData blocks until data is available past offset, the stream is
-// closed, or ctx is cancelled.  It is safe to call concurrently.
-//
-// Implementation: a helper goroutine watches ctx and calls cond.Broadcast()
-// when the context fires, so the cond.Wait() loop wakes cleanly without
-// busy-spinning.  The helper is bounded to the lifetime of this call.
+// WaitForData blocks until data is available past offset, stream is closed,
+// or ctx is cancelled.
 func (b *StreamBuffer) WaitForData(ctx context.Context, offset int64) {
 	b.mu.Lock()
-	// Fast path: condition already satisfied.
 	if b.closed || b.writeOffset > offset || ctx.Err() != nil {
 		b.mu.Unlock()
 		return
 	}
 
-	// Slow path: spawn watcher, then wait.
-	quit := make(chan struct{}) // closed when WaitForData returns
+	quit := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
 			b.cond.Broadcast()
 		case <-quit:
-			// WaitForData returned normally; nothing to do.
 		}
 	}()
 
@@ -179,26 +168,23 @@ func (b *StreamBuffer) WaitForData(ctx context.Context, offset int64) {
 }
 
 // Trim frees all segments whose data ends at or before minOffset.
-// Called by the PushBroker with the minimum ACKed offset across all subscribers.
 func (b *StreamBuffer) Trim(minOffset int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	trimmed := 0
-	for _, seg := range b.segments {
-		if seg.baseOffset+int64(len(seg.data)) <= minOffset {
-			trimmed++
-		} else {
-			break
-		}
-	}
-	if trimmed == 0 {
+
+	// Binary search: find the first segment NOT fully consumed.
+	trimCount := sort.Search(len(b.segments), func(i int) bool {
+		return b.segments[i].baseOffset+int64(len(b.segments[i].data)) > minOffset
+	})
+
+	if trimCount == 0 {
 		return
 	}
-	b.segments = b.segments[trimmed:]
+	b.segments = b.segments[trimCount:]
 	if len(b.segments) > 0 {
 		b.baseOffset = b.segments[0].baseOffset
 	} else {
 		b.baseOffset = b.writeOffset
 	}
-	b.cond.Broadcast() // unblock any Append waiting for space
+	b.cond.Broadcast()
 }

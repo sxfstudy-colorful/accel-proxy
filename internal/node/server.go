@@ -9,23 +9,8 @@ import (
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ProxyServer — multi-role process entry point
-//
-// A single process may run any combination of the three roles:
-//
-//   access  — accepts client connections, dials tunnels outward
-//   relay   — accepts inbound tunnels, forwards to next hop
-//   egress  — accepts inbound tunnels, connects to origin servers
-//
-// Each active role is an independent node instance with its own listener,
-// goroutines, and hot-reload state. Roles absent from the config (nil section)
-// are simply not started.
-//
-// Lifecycle:
-//   NewProxyServer → Start() → [running] → Stop()
-//   SIGHUP → Reload(rc) + ReloadCert()
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ProxyServer holds the active role instances for this process.
 type ProxyServer struct {
 	access *AccessNode
 	relay  *RelayNode
@@ -33,13 +18,21 @@ type ProxyServer struct {
 	logger *slog.Logger
 }
 
-// NewProxyServer constructs a ProxyServer from a Config.
-// Only roles with a non-nil section in cfg are instantiated.
 func NewProxyServer(cfg *config.Config, logger *slog.Logger) (*ProxyServer, error) {
 	srv := &ProxyServer{logger: logger}
 
+	// Determine PSK: relay and egress nodes have it in their TunnelConfig.
+	// Access nodes need it too (for outbound dial signing). We take it from
+	// whichever tunnel config is available, falling back to empty.
+	psk := ""
+	if cfg.Relay != nil {
+		psk = cfg.Relay.Tunnel.PSK
+	} else if cfg.Egress != nil {
+		psk = cfg.Egress.Tunnel.PSK
+	}
+
 	if cfg.Access != nil {
-		n, err := NewAccessNode(cfg.Access, logger)
+		n, err := NewAccessNode(cfg.Access, psk, logger)
 		if err != nil {
 			return nil, fmt.Errorf("access role: %w", err)
 		}
@@ -61,8 +54,6 @@ func NewProxyServer(cfg *config.Config, logger *slog.Logger) (*ProxyServer, erro
 	return srv, nil
 }
 
-// Start starts all active roles.
-// If any role fails to start, already-started roles are stopped before returning.
 func (s *ProxyServer) Start() error {
 	var started []func()
 
@@ -95,8 +86,6 @@ func (s *ProxyServer) Start() error {
 	return nil
 }
 
-// Stop gracefully shuts down all active roles concurrently and waits for all
-// in-flight connections to drain.
 func (s *ProxyServer) Stop() {
 	type stopper interface{ Stop() }
 	var roles []stopper
@@ -120,8 +109,6 @@ func (s *ProxyServer) Stop() {
 	}
 }
 
-// Reload dispatches hot-reload to each active role.
-// Each role only processes the ReloadableConfig fields relevant to it.
 func (s *ProxyServer) Reload(rc ReloadableConfig) error {
 	if s.access != nil {
 		if err := s.access.Reload(rc); err != nil {
@@ -141,7 +128,6 @@ func (s *ProxyServer) Reload(rc ReloadableConfig) error {
 	return nil
 }
 
-// ReloadCert triggers TLS certificate reload on roles that own a tunnel listener.
 func (s *ProxyServer) ReloadCert() error {
 	if s.relay != nil {
 		if err := s.relay.ReloadCert(); err != nil {

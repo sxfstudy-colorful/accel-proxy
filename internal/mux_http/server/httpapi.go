@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/sxfstudy-colorful/accel-proxy/internal/mux_http/muxproto"
@@ -15,18 +17,26 @@ import (
 //   - a TCP listener for edge node connections (forwarded by accel-proxy)
 //   - an HTTP listener for origin push requests and admin queries
 type Server struct {
-	broker   *PushBroker
-	logger   *slog.Logger
-	edgeAddr string
-	httpAddr string
+	broker     *PushBroker
+	logger     *slog.Logger
+	edgeAddr   string
+	httpAddr   string
+	pushAPIKey string // if non-empty, POST /push requires Authorization: Bearer <key>
+
+	edgeLn  net.Listener // saved for graceful shutdown
+	httpSrv *http.Server
 }
 
-func NewServer(edgeAddr, httpAddr string, logger *slog.Logger) *Server {
+// NewServer creates a mux Server.
+// pushAPIKey: if non-empty, all POST /push requests must include
+// "Authorization: Bearer <pushAPIKey>". Empty = no auth (backward-compatible).
+func NewServer(edgeAddr, httpAddr, pushAPIKey string, logger *slog.Logger) *Server {
 	return &Server{
-		broker:   NewPushBroker(logger),
-		logger:   logger,
-		edgeAddr: edgeAddr,
-		httpAddr: httpAddr,
+		broker:     NewPushBroker(logger),
+		logger:     logger,
+		edgeAddr:   edgeAddr,
+		httpAddr:   httpAddr,
+		pushAPIKey: pushAPIKey,
 	}
 }
 
@@ -40,8 +50,27 @@ func (s *Server) Run() error {
 	return <-errCh
 }
 
+// Close gracefully shuts down the server.
+func (s *Server) Close(ctx context.Context) error {
+	var firstErr error
+
+	// FIX: close the edge TCP listener so Accept() returns.
+	if s.edgeLn != nil {
+		if err := s.edgeLn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if s.httpSrv != nil {
+		if err := s.httpSrv.Shutdown(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	s.broker.Close()
+	return firstErr
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Edge TCP listener (receives connections forwarded by accel-proxy)
+// Edge TCP listener
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (s *Server) runEdgeListener() error {
@@ -49,11 +78,13 @@ func (s *Server) runEdgeListener() error {
 	if err != nil {
 		return fmt.Errorf("edge listener %s: %w", s.edgeAddr, err)
 	}
+	s.edgeLn = ln // save for Close()
 	s.logger.Info("edge listener started", "addr", ln.Addr())
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			// After Close() is called, Accept returns an error — this is normal.
 			return fmt.Errorf("edge accept: %w", err)
 		}
 		muxConn := muxproto.NewMuxConn(conn)
@@ -64,10 +95,10 @@ func (s *Server) runEdgeListener() error {
 // ─────────────────────────────────────────────────────────────────────────────
 // HTTP API
 //
-//	POST /push/{stream_name}         — origin pushes data into the named stream
-//	GET  /streams                    — list streams and their write offsets
-//	GET  /nodes                      — list connected edge node IDs
-//	GET  /health                     — liveness probe
+//	POST /push/{stream_name}   — origin pushes data (auth required if pushAPIKey set)
+//	GET  /streams              — list streams and their write offsets
+//	GET  /nodes                — list connected edge node IDs
+//	GET  /health               — liveness probe
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (s *Server) runHTTPServer() error {
@@ -79,6 +110,17 @@ func (s *Server) runHTTPServer() error {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+
+		// Auth check.
+		if s.pushAPIKey != "" {
+			auth := r.Header.Get("Authorization")
+			expected := "Bearer " + s.pushAPIKey
+			if !strings.EqualFold(auth, expected) {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+
 		name := r.URL.Path[len("/push/"):]
 		if name == "" {
 			http.Error(w, "stream name required", http.StatusBadRequest)
@@ -93,7 +135,6 @@ func (s *Server) runHTTPServer() error {
 		dur := time.Since(start)
 		if err != nil {
 			s.logger.Error("push error", "stream", name, "bytes", n, "dur", dur, "err", err)
-			// Headers may already be sent if we streamed; log but don't WriteHeader again.
 			return
 		}
 		s.logger.Info("push complete", "stream", name, "bytes", n, "dur", dur)
@@ -124,7 +165,7 @@ func (s *Server) runHTTPServer() error {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"}) //nolint:errcheck
 	})
 
-	srv := &http.Server{Addr: s.httpAddr, Handler: mux}
+	s.httpSrv = &http.Server{Addr: s.httpAddr, Handler: mux}
 	s.logger.Info("HTTP API server started", "addr", s.httpAddr)
-	return srv.ListenAndServe()
+	return s.httpSrv.ListenAndServe()
 }

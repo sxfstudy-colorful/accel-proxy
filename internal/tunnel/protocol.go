@@ -22,57 +22,39 @@ const Version = 1
 
 // HandshakeRequest is sent by the dialing side right after the WebSocket
 // handshake completes.
-//
-// Routing is IDC-based:
-//   - Access node sets TargetIDC once, derived from the service config.
-//   - Relay nodes forward this unchanged; they select the next hop purely
-//     by looking up TargetIDC in their own route table.
-//   - Egress node uses ServiceID to find the local origin address.
-//     It does NOT receive a host/port from upstream — origin addresses are
-//     a local concern of each IDC and are never transmitted over the wire.
 type HandshakeRequest struct {
-	// Version must equal tunnel.Version.
-	Version int `json:"version"`
+	Version   int               `json:"version"`
+	ServiceID string            `json:"service_id"`
+	TargetIDC string            `json:"target_idc"`
+	Protocol  string            `json:"protocol"`
+	ClientIP  string            `json:"client_ip"`
+	HopCount  int               `json:"hop_count"`
+	Metadata  map[string]string `json:"metadata,omitempty"`
 
-	// ServiceID identifies the business service.
-	// Used by relay nodes for route table lookup and by egress to find
-	// the local origin address.
-	ServiceID string `json:"service_id"`
-
-	// TargetIDC is the datacenter that holds the origin for this service.
-	// This is the sole routing key carried through the entire hop chain.
-	// Set by the access node; never modified by relay nodes.
-	TargetIDC string `json:"target_idc"`
-
-	// Protocol is the L4/L7 protocol: "tcp", "http", "https".
-	// Carried to egress so it knows whether to dial plain TCP or TLS.
-	Protocol string `json:"protocol"`
-
-	// ClientIP is the original client's remote address, propagated for
-	// logging and X-Forwarded-For insertion at the access node.
-	ClientIP string `json:"client_ip"`
-
-	// HopCount tracks relay hops traversed (loop guard, max = MaxHopCount).
-	HopCount int `json:"hop_count"`
-
-	// Metadata carries arbitrary key-value pairs (e.g. SNI hostname, trace ID).
-	Metadata map[string]string `json:"metadata,omitempty"`
+	// Authentication fields — set by SignRequest, verified by VerifyRequest.
+	// Empty when PSK is not configured (backward-compatible unsigned mode).
+	Timestamp int64  `json:"ts,omitempty"`
+	Signature string `json:"sig,omitempty"`
 }
+
+type RespStatus string
+
+const (
+	RespStatusOk    RespStatus = "ok"
+	RespStatusError RespStatus = "error"
+)
 
 // HandshakeResponse is sent back by the receiving side.
 type HandshakeResponse struct {
-	Status  string `json:"status"`            // "ok" or "error"
-	Message string `json:"message,omitempty"` // error description
-	NodeID  string `json:"node_id"`           // responder's node ID for tracing
+	Status  RespStatus `json:"status"`            // "ok" or "error"
+	Message string     `json:"message,omitempty"` // error description
+	NodeID  string     `json:"node_id"`           // responder's node ID for tracing
 }
 
 // MaxHopCount is the maximum number of relay hops allowed (loop guard).
 const MaxHopCount = 16
 
 // SendHandshake writes a HandshakeRequest and waits for a HandshakeResponse.
-// Used by relay/egress servers that accept inbound tunnels; the dialer uses
-// writeHandshakeRequest + readHandshakeResponse separately to enforce the
-// retry-safety boundary (see dialer.go).
 func SendHandshake(conn *websocket.Conn, req *HandshakeRequest) (*HandshakeResponse, error) {
 	if err := writeHandshakeRequest(conn, req); err != nil {
 		return nil, err
@@ -80,8 +62,6 @@ func SendHandshake(conn *websocket.Conn, req *HandshakeRequest) (*HandshakeRespo
 	return readHandshakeResponse(conn)
 }
 
-// writeHandshakeRequest sends the HandshakeRequest frame.
-// A failure here means the remote never received the request — safe to retry.
 func writeHandshakeRequest(conn *websocket.Conn, req *HandshakeRequest) error {
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := conn.WriteJSON(req); err != nil {
@@ -91,9 +71,6 @@ func writeHandshakeRequest(conn *websocket.Conn, req *HandshakeRequest) error {
 	return nil
 }
 
-// readHandshakeResponse reads the HandshakeResponse frame.
-// By the time this is called the remote has already received the request and
-// started building its downstream chain — a failure here must NOT be retried.
 func readHandshakeResponse(conn *websocket.Conn) (*HandshakeResponse, error) {
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	_, msg, err := conn.ReadMessage()
@@ -143,9 +120,9 @@ func SendResponse(conn *websocket.Conn, resp *HandshakeResponse) error {
 }
 
 func OKResponse(nodeID string) *HandshakeResponse {
-	return &HandshakeResponse{Status: "ok", NodeID: nodeID}
+	return &HandshakeResponse{Status: RespStatusOk, NodeID: nodeID}
 }
 
 func ErrResponse(nodeID, msg string) *HandshakeResponse {
-	return &HandshakeResponse{Status: "error", NodeID: nodeID, Message: msg}
+	return &HandshakeResponse{Status: RespStatusError, NodeID: nodeID, Message: msg}
 }

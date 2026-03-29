@@ -2,18 +2,23 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
-# build.sh  —  编译 accel-proxy
+# build.sh  —  编译 accel-proxy 全部组件
 #
 # 用法:
 #   ./build.sh                  # 编译当前平台
-#   ./build.sh --cross          # 交叉编译 linux/amd64  linux/arm64  darwin/amd64
+#   ./build.sh --cross          # 交叉编译 linux/amd64  linux/arm64  darwin/amd64  darwin/arm64
 #   ./build.sh --clean          # 仅清理 output 目录
 #   GOOS=linux GOARCH=arm64 ./build.sh  # 手动指定目标平台
 # ─────────────────────────────────────────────────────────────────────────────
 
-BINARY="accel-proxy"
-CMD_PATH="./cmd/proxy"
-OUTPUT_DIR="$(mktemp -d ./output.XXXXXX)"   # 每次 build 创建新的临时输出目录
+# All binaries to build: name:cmd_path
+BINARIES=(
+    "accel-proxy:./cmd/proxy"
+    "mux-server:./cmd/mux-server"
+    "mux-client:./cmd/mux-client"
+)
+
+OUTPUT_DIR="$(mktemp -d ./output.XXXXXX)"
 
 VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
 BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -32,7 +37,6 @@ error() { echo -e "${RED}[error]${NC} $*" >&2; }
 
 # ── 清理函数 ─────────────────────────────────────────────────────────────────
 cleanup_old_outputs() {
-    # 保留最新 3 个 output 目录，删除其余旧的
     local dirs
     dirs=$(ls -dt ./output.* 2>/dev/null || true)
     local count=0
@@ -75,25 +79,32 @@ info "output dir : ${OUTPUT_DIR}"
 
 # ── 编译 ─────────────────────────────────────────────────────────────────────
 build_one() {
-    local os="$1" arch="$2"
-    local out="${OUTPUT_DIR}/${BINARY}-${os}-${arch}"
+    local binary="$1" cmd_path="$2" os="$3" arch="$4"
+    local out="${OUTPUT_DIR}/${binary}-${os}-${arch}"
     [[ "$os" == "windows" ]] && out="${out}.exe"
 
-    info "building ${os}/${arch} → ${out}"
+    info "building ${binary} (${os}/${arch}) → ${out}"
     CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-        go build -trimpath -ldflags "${LDFLAGS}" -o "${out}" "${CMD_PATH}"
+        go build -trimpath -ldflags "${LDFLAGS}" -o "${out}" "${cmd_path}"
+}
+
+build_all() {
+    local os="$1" arch="$2"
+    for entry in "${BINARIES[@]}"; do
+        IFS=':' read -r name cmd_path <<< "$entry"
+        build_one "$name" "$cmd_path" "$os" "$arch"
+    done
 }
 
 if $CROSS; then
-    build_one linux  amd64
-    build_one linux  arm64
-    build_one darwin amd64
-    build_one darwin arm64
+    build_all linux  amd64
+    build_all linux  arm64
+    build_all darwin amd64
+    build_all darwin arm64
 else
-    # 单平台：使用环境变量或当前平台
     HOST_OS=$(go env GOOS)
     HOST_ARCH=$(go env GOARCH)
-    build_one "${GOOS:-$HOST_OS}" "${GOARCH:-$HOST_ARCH}"
+    build_all "${GOOS:-$HOST_OS}" "${GOARCH:-$HOST_ARCH}"
 fi
 
 # ── 写入构建信息 ──────────────────────────────────────────────────────────────
