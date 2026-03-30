@@ -16,6 +16,8 @@ BINARIES=(
     "accel-proxy:./cmd/proxy"
     "mux-server:./cmd/mux-server"
     "mux-client:./cmd/mux-client"
+    "rmux-server:./cmd/rmux-server"
+    "rmux-client:./cmd/rmux-client"
 )
 
 OUTPUT_DIR="$(mktemp -d ./output.XXXXXX)"

@@ -1,7 +1,6 @@
 package tunnel
 
 import (
-	"fmt"
 	"log/slog"
 	"time"
 )
@@ -56,7 +55,7 @@ func (d *Dialer) tryEndpoint(ep *HopEndpoint, req *HandshakeRequest) (*Transport
 	// Sign the request before sending if PSK is configured.
 	SignRequest(req, d.psk)
 
-	if resp, err := SendHandshake(conn, req); err != nil {
+	if _, err := SendHandshake(conn, req); err != nil {
 		conn.Close()
 		d.logger.Warn("next-hop handshake failed, trying next candidate",
 			"identity", addr.Identity(),
@@ -64,14 +63,6 @@ func (d *Dialer) tryEndpoint(ep *HopEndpoint, req *HandshakeRequest) (*Transport
 			"err", err,
 		)
 		return nil, time.Since(start), err
-	} else if resp.Status != RespStatusOk {
-		conn.Close()
-		d.logger.Warn("next-hop handshake failed, trying next candidate",
-			"identity", addr.Identity(),
-			"idc", req.TargetIDC,
-			"err", fmt.Sprint("status: %s, message: %s", resp.Status, resp.Message),
-		)
-		return nil, time.Since(start), fmt.Errorf("status: %s, message: %s", resp.Status, resp.Message)
 	}
 
 	elapsed := time.Since(start)

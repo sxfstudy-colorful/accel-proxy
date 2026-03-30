@@ -187,9 +187,6 @@ func (inst *serviceInstance) handleConn(conn net.Conn) {
 
 	defer func() {
 		_ = tun.Close()
-		if e := recover(); e != nil {
-			inst.logger.Error("handler panic", "remote", conn.RemoteAddr(), "panic", e)
-		}
 	}()
 
 	switch inst.cfg.Protocol {

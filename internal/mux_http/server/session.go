@@ -13,26 +13,20 @@ import (
 )
 
 const (
-	defaultSendWindow = 8 * 1024 * 1024 // 8 MiB
+	defaultSendWindow = 8 * 1024 * 1024
 	pingInterval      = 20 * time.Second
 	pingTimeout       = 15 * time.Second
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// streamSendState — flow-control bookkeeping for one stream → one edge
-//
-// sendOffset is atomic because it is written by the sender goroutine and
-// read by inflight() which may be called from waitWindow in the same goroutine.
-// Although currently single-writer, making it atomic eliminates the data race
-// that the race detector would flag and is future-proof against callers from
-// other goroutines (e.g. monitoring/metrics).
+// streamSendState (push mode, unchanged)
 // ─────────────────────────────────────────────────────────────────────────────
 
 type streamSendState struct {
 	entry       *StreamEntry
-	sendOffset  atomic.Int64 // bytes written to wire for this edge
-	ackedOffset atomic.Int64 // bytes the edge has confirmed received
-	window      int64        // max allowed (sendOffset - ackedOffset)
+	sendOffset  atomic.Int64
+	ackedOffset atomic.Int64
+	window      int64
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -77,7 +71,6 @@ func (s *streamSendState) waitWindow(ctx context.Context) error {
 	return nil
 }
 
-// updateAck records a cumulative ACK from the edge.
 func (s *streamSendState) updateAck(offset int64) {
 	for {
 		old := s.ackedOffset.Load()
@@ -101,7 +94,7 @@ func (s *streamSendState) evict() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// EdgeSession — one long-lived connection from an edge node
+// EdgeSession
 // ─────────────────────────────────────────────────────────────────────────────
 
 type EdgeSession struct {
@@ -110,13 +103,28 @@ type EdgeSession struct {
 	logger *slog.Logger
 	broker *PushBroker
 
+	// Capabilities declared during registration.
+	capPush      bool
+	capHTTPProxy bool
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	mu      sync.Mutex
-	streams map[uint32]*streamSendState
+	streams map[uint32]*streamSendState // push streams
+
+	// httpRespBuf accumulates streamed response body chunks per request ID.
+	// Only used when body arrives in multiple TypeHTTPResponseBody frames.
+	httpRespMu  sync.Mutex
+	httpRespBuf map[uint32]*httpResponseAccumulator
 
 	once sync.Once
+}
+
+// httpResponseAccumulator collects streamed response parts.
+type httpResponseAccumulator struct {
+	head *muxproto.HTTPResponseHeadMsg
+	body []byte
 }
 
 func newEdgeSession(
@@ -127,13 +135,14 @@ func newEdgeSession(
 ) *EdgeSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &EdgeSession{
-		nodeID:  nodeID,
-		conn:    conn,
-		broker:  broker,
-		logger:  logger.With("node_id", nodeID, "remote", conn.RemoteAddr()),
-		ctx:     ctx,
-		cancel:  cancel,
-		streams: make(map[uint32]*streamSendState),
+		nodeID:      nodeID,
+		conn:        conn,
+		broker:      broker,
+		logger:      logger.With("node_id", nodeID, "remote", conn.RemoteAddr()),
+		ctx:         ctx,
+		cancel:      cancel,
+		streams:     make(map[uint32]*streamSendState),
+		httpRespBuf: make(map[uint32]*httpResponseAccumulator),
 	}
 }
 
@@ -161,8 +170,6 @@ func (s *EdgeSession) addStream(entry *StreamEntry) *streamSendState {
 	return st
 }
 
-// startSender launches a goroutine that reads from the StreamBuffer starting
-// at resumeOffset and writes DATA frames to the edge connection.
 func (s *EdgeSession) startSender(st *streamSendState, resumeOffset int64) {
 	st.sendOffset.Store(resumeOffset)
 	st.ackedOffset.Store(resumeOffset)
@@ -214,8 +221,8 @@ func (s *EdgeSession) startSender(st *streamSendState, resumeOffset int64) {
 	}()
 }
 
-// readLoop processes inbound frames from the edge until the connection closes
-// or the session is cancelled.
+// readLoop processes inbound frames from the edge.
+// Handles both push ACKs and HTTP reverse proxy responses.
 func (s *EdgeSession) readLoop() {
 	go s.pingLoop()
 	defer s.closeWithReason("read loop exited")
@@ -230,6 +237,7 @@ func (s *EdgeSession) readLoop() {
 		}
 
 		switch f.Type {
+		// ── Push stream frames ───────────────────────────────────────────
 		case muxproto.TypeAck:
 			var msg muxproto.AckMsg
 			if err := muxproto.Unmarshal(f.Payload, &msg); err != nil {
@@ -243,17 +251,97 @@ func (s *EdgeSession) readLoop() {
 			s.mu.Unlock()
 			s.broker.onAck(s.nodeID, msg.StreamID, msg.Offset)
 
+		// ── Keepalive ────────────────────────────────────────────────────
 		case muxproto.TypePong:
 			s.broker.onPong(s.nodeID)
 
 		case muxproto.TypePing:
 			s.conn.WriteFrame(&muxproto.Frame{Type: muxproto.TypePong}) //nolint:errcheck
 
+		// ── HTTP reverse proxy response frames ───────────────────────────
+		case muxproto.TypeHTTPResponseHead:
+			s.handleHTTPResponseHead(f)
+
+		case muxproto.TypeHTTPResponseBody:
+			s.handleHTTPResponseBody(f)
+
+		case muxproto.TypeHTTPResponseEnd:
+			s.handleHTTPResponseEnd(f)
+
+		case muxproto.TypeHTTPError:
+			s.handleHTTPError(f)
+
 		default:
 			s.logger.Warn("unexpected frame type from edge", "type", f.Type)
 		}
 	}
 }
+
+// ── HTTP response frame handlers ─────────────────────────────────────────────
+
+func (s *EdgeSession) handleHTTPResponseHead(f *muxproto.Frame) {
+	reqID := f.StreamID
+	var msg muxproto.HTTPResponseHeadMsg
+	if err := muxproto.Unmarshal(f.Payload, &msg); err != nil {
+		s.logger.Warn("bad HTTPResponseHead payload", "request_id", reqID, "err", err)
+		return
+	}
+
+	// Start accumulating: store head, wait for body chunks + end.
+	s.httpRespMu.Lock()
+	s.httpRespBuf[reqID] = &httpResponseAccumulator{head: &msg}
+	s.httpRespMu.Unlock()
+}
+
+func (s *EdgeSession) handleHTTPResponseBody(f *muxproto.Frame) {
+	reqID := f.StreamID
+
+	s.httpRespMu.Lock()
+	acc, ok := s.httpRespBuf[reqID]
+	if ok {
+		acc.body = append(acc.body, f.Payload...)
+	}
+	s.httpRespMu.Unlock()
+
+	if !ok {
+		s.logger.Warn("HTTPResponseBody for unknown accumulator", "request_id", reqID)
+	}
+}
+
+func (s *EdgeSession) handleHTTPResponseEnd(f *muxproto.Frame) {
+	reqID := f.StreamID
+
+	s.httpRespMu.Lock()
+	acc, ok := s.httpRespBuf[reqID]
+	delete(s.httpRespBuf, reqID)
+	s.httpRespMu.Unlock()
+
+	if !ok || acc.head == nil {
+		s.logger.Warn("HTTPResponseEnd without head", "request_id", reqID)
+		return
+	}
+
+	// Deliver the complete response to the waiting HTTP handler.
+	s.broker.HTTPProxy.OnHTTPResponseComplete(reqID, acc.head, acc.body)
+}
+
+func (s *EdgeSession) handleHTTPError(f *muxproto.Frame) {
+	reqID := f.StreamID
+	var msg muxproto.HTTPErrorMsg
+	if err := muxproto.Unmarshal(f.Payload, &msg); err != nil {
+		s.logger.Warn("bad HTTPError payload", "request_id", reqID, "err", err)
+		return
+	}
+
+	// Clean up any partial accumulator.
+	s.httpRespMu.Lock()
+	delete(s.httpRespBuf, reqID)
+	s.httpRespMu.Unlock()
+
+	s.broker.HTTPProxy.OnHTTPError(reqID, &msg)
+}
+
+// ── Ping loop (unchanged) ────────────────────────────────────────────────────
 
 func (s *EdgeSession) pingLoop() {
 	ticker := time.NewTicker(pingInterval)

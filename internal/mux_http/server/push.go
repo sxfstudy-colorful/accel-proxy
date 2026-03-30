@@ -14,15 +14,18 @@ import (
 const (
 	bufferMaxRetain   = 512 * 1024 * 1024 // 512 MiB retained per stream
 	trimInterval      = 5 * time.Second
-	evictLagThreshold = int64(bufferMaxRetain) * 8 / 10 // 80%
+	evictLagThreshold = int64(bufferMaxRetain) * 8 / 10
 )
 
-// PushBroker is the central coordinator.
+// PushBroker is the central coordinator for both stream push and HTTP reverse proxy.
 type PushBroker struct {
 	logger  *slog.Logger
 	nodes   *NodeRegistry
 	subs    *SubscriptionTable
 	streams *StreamRegistry
+
+	// HTTP reverse proxy broker — shares the same NodeRegistry.
+	HTTPProxy *HTTPProxyBroker
 
 	ackMu    sync.Mutex
 	ackTable map[ackKey]int64
@@ -30,7 +33,6 @@ type PushBroker struct {
 	pongMu    sync.Mutex
 	pongTable map[string]chan time.Time
 
-	// FIX: lifecycle management — trimLoop stops when ctx is cancelled.
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -42,11 +44,13 @@ type ackKey struct {
 
 func NewPushBroker(logger *slog.Logger) *PushBroker {
 	ctx, cancel := context.WithCancel(context.Background())
+	nodes := NewNodeRegistry()
 	b := &PushBroker{
 		logger:    logger,
-		nodes:     NewNodeRegistry(),
+		nodes:     nodes,
 		subs:      NewSubscriptionTable(),
 		streams:   NewStreamRegistry(bufferMaxRetain),
+		HTTPProxy: NewHTTPProxyBroker(nodes, 30*time.Second, logger),
 		ackTable:  make(map[ackKey]int64),
 		pongTable: make(map[string]chan time.Time),
 		ctx:       ctx,
@@ -56,7 +60,6 @@ func NewPushBroker(logger *slog.Logger) *PushBroker {
 	return b
 }
 
-// Close stops all background goroutines (trimLoop, etc.).
 func (b *PushBroker) Close() {
 	b.cancel()
 }
@@ -117,10 +120,19 @@ func (b *PushBroker) HandleEdgeConn(conn *muxproto.MuxConn) {
 		return
 	}
 	logger = logger.With("node_id", reg.NodeID)
-	logger.Info("edge connected", "subs", reg.Subs, "resume", reg.Resume)
+	logger.Info("edge connected", "subs", reg.Subs, "caps", reg.Caps, "resume", reg.Resume)
 
 	sess := newEdgeSession(reg.NodeID, conn, b, logger)
 
+	// Determine capabilities.
+	capsSet := make(map[string]bool, len(reg.Caps))
+	for _, c := range reg.Caps {
+		capsSet[c] = true
+	}
+	sess.capPush = capsSet["push"] || len(reg.Subs) > 0 // backward compat
+	sess.capHTTPProxy = capsSet["http_proxy"]
+
+	// Set up push streams.
 	streamIDs := make(map[string]uint32, len(reg.Subs))
 	for _, name := range reg.Subs {
 		entry := b.streams.GetOrCreate(name)
@@ -152,6 +164,7 @@ func (b *PushBroker) HandleEdgeConn(conn *muxproto.MuxConn) {
 
 	b.nodes.Register(reg.NodeID, sess)
 
+	// Start push senders.
 	for _, name := range reg.Subs {
 		entry := b.streams.GetOrCreate(name)
 		sess.mu.Lock()
@@ -162,15 +175,17 @@ func (b *PushBroker) HandleEdgeConn(conn *muxproto.MuxConn) {
 		}
 	}
 
+	// Drive the read loop (blocks until connection closes).
 	sess.readLoop()
 
+	// Cleanup.
 	b.nodes.Unregister(reg.NodeID, sess)
 	b.subs.Unsubscribe(reg.NodeID)
 	logger.Info("edge session closed")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Origin push
+// Origin push (retained from v3)
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (b *PushBroker) Push(ctx context.Context, streamName string, r io.Reader) (int64, error) {
@@ -223,8 +238,29 @@ func (b *PushBroker) NodeIDs() []string {
 	return ids
 }
 
+// NodeInfo returns extended info including capabilities.
+func (b *PushBroker) NodeInfo() []map[string]any {
+	sessions := b.nodes.All()
+	out := make([]map[string]any, len(sessions))
+	for i, s := range sessions {
+		caps := make([]string, 0, 2)
+		if s.capPush {
+			caps = append(caps, "push")
+		}
+		if s.capHTTPProxy {
+			caps = append(caps, "http_proxy")
+		}
+		out[i] = map[string]any{
+			"node_id": s.nodeID,
+			"caps":    caps,
+			"remote":  s.conn.RemoteAddr().String(),
+		}
+	}
+	return out
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// ACK tracking + buffer trimming
+// ACK tracking + buffer trimming (retained from v3)
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (b *PushBroker) onAck(nodeID string, streamID uint32, offset int64) {
@@ -248,8 +284,6 @@ func (b *PushBroker) onAck(nodeID string, streamID uint32, offset int64) {
 	}
 }
 
-// trimLoop runs in the background, trimming buffers and cleaning up finished
-// streams. FIX: now stoppable via ctx.
 func (b *PushBroker) trimLoop() {
 	ticker := time.NewTicker(trimInterval)
 	defer ticker.Stop()
@@ -264,7 +298,6 @@ func (b *PushBroker) trimLoop() {
 }
 
 func (b *PushBroker) trimAll() {
-	// Build: streamID → minimum acked offset across all subscribers.
 	type minAck struct {
 		offset int64
 		set    bool
@@ -296,7 +329,7 @@ func (b *PushBroker) trimAll() {
 		entry.Buffer.Trim(ma.offset)
 	}
 
-	// FIX: clean up closed streams with no subscribers.
+	// Clean up closed streams with no subscribers.
 	for _, name := range b.streams.ClosedStreams() {
 		subscribers := b.subs.Subscribers(name)
 		if len(subscribers) == 0 {

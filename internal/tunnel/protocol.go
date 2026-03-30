@@ -37,18 +37,11 @@ type HandshakeRequest struct {
 	Signature string `json:"sig,omitempty"`
 }
 
-type RespStatus string
-
-const (
-	RespStatusOk    RespStatus = "ok"
-	RespStatusError RespStatus = "error"
-)
-
 // HandshakeResponse is sent back by the receiving side.
 type HandshakeResponse struct {
-	Status  RespStatus `json:"status"`            // "ok" or "error"
-	Message string     `json:"message,omitempty"` // error description
-	NodeID  string     `json:"node_id"`           // responder's node ID for tracing
+	Status  string `json:"status"`            // "ok" or "error"
+	Message string `json:"message,omitempty"` // error description
+	NodeID  string `json:"node_id"`           // responder's node ID for tracing
 }
 
 // MaxHopCount is the maximum number of relay hops allowed (loop guard).
@@ -120,9 +113,9 @@ func SendResponse(conn *websocket.Conn, resp *HandshakeResponse) error {
 }
 
 func OKResponse(nodeID string) *HandshakeResponse {
-	return &HandshakeResponse{Status: RespStatusOk, NodeID: nodeID}
+	return &HandshakeResponse{Status: "ok", NodeID: nodeID}
 }
 
 func ErrResponse(nodeID, msg string) *HandshakeResponse {
-	return &HandshakeResponse{Status: RespStatusError, NodeID: nodeID, Message: msg}
+	return &HandshakeResponse{Status: "error", NodeID: nodeID, Message: msg}
 }

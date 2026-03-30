@@ -6,10 +6,7 @@ import (
 	"sync"
 )
 
-// MuxConn wraps a net.Conn and provides frame-level read/write with:
-//   - buffered reading  (reduces syscall count on the read path)
-//   - buffered writing  (merges header+payload into one syscall per frame)
-//   - serialised writing (multiple goroutines can safely call WriteFrame)
+// MuxConn provides frame-level read/write with buffered I/O and serialised writes.
 type MuxConn struct {
 	conn net.Conn
 	br   *bufio.Reader
@@ -29,6 +26,7 @@ func (c *MuxConn) ReadFrame() (*Frame, error) {
 	return ReadFrame(c.br)
 }
 
+// WriteFrame serialises one frame. Thread-safe.
 func (c *MuxConn) WriteFrame(f *Frame) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()

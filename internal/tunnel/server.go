@@ -40,8 +40,8 @@ func NewServer(cfg *config.TunnelConfig, nodeID string, handler ConnHandler, log
 	}
 
 	s := &Server{
-		cfg:     cfg,
-		nodeID:  nodeID,
+		cfg:    cfg,
+		nodeID: nodeID,
 		handler: handler,
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 10 * time.Second,
@@ -173,13 +173,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	)
 
 	tun := NewTransport(conn, s.cfg.MaxFrameSize, s.logger)
-	defer func() {
-		tun.Close()
-		if e := recover(); e != nil {
-			s.logger.Error("handler panic", "remote", r.RemoteAddr, "panic", e)
-		}
-	}()
-
 	s.handler(req, tun)
 }
 
