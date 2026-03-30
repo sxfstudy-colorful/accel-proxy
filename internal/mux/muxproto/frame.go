@@ -192,3 +192,26 @@ var (
 	ErrStreamReset   = errors.New("stream reset by peer")
 	ErrOffsetEvicted = errors.New("offset evicted from buffer")
 )
+
+// TypeWindowUpdate is added for per-stream flow control.
+// Either side sends this to grant the remote sender more send credits.
+const TypeWindowUpdate FrameType = 0x30
+
+// WinDir identifies which direction of a stream the WINDOW_UPDATE applies to.
+type WinDir uint8
+
+const (
+	// WinDirRequest: credits for server→client (request body DATA frames).
+	// Sent by the client (receiver) to allow the server (sender) to send more.
+	WinDirRequest WinDir = 0
+	// WinDirResponse: credits for client→server (response body DATA frames).
+	// Sent by the server (receiver) to allow the client (sender) to send more.
+	WinDirResponse WinDir = 1
+)
+
+// WindowUpdateMsg is the payload of a TypeWindowUpdate frame.
+type WindowUpdateMsg struct {
+	StreamID  uint32 `json:"sid"`
+	Increment int32  `json:"inc"` // bytes to add to the sender's window
+	Dir       WinDir `json:"dir"`
+}

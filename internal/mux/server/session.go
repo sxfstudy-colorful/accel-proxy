@@ -17,12 +17,11 @@ type EdgeSession struct {
 	conn         *muxproto.MuxConn
 	server       *Server
 	logger       *slog.Logger
-	capabilities []string // e.g. ["reverse-http", "push"]
+	capabilities []string
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// streams tracks active request-response streams by ID.
 	mu      sync.RWMutex
 	streams map[uint32]*muxproto.Stream
 
@@ -56,7 +55,6 @@ func (s *EdgeSession) closeWithReason(reason string) {
 		s.logger.Info("closing edge session", "reason", reason)
 		s.cancel()
 		s.conn.Close()
-		// Reset all active streams.
 		s.mu.Lock()
 		for _, st := range s.streams {
 			st.OnRST("session closed: " + reason)
@@ -67,14 +65,17 @@ func (s *EdgeSession) closeWithReason(reason string) {
 }
 
 // DoRequest pushes an HTTP request to the edge and waits for the response.
-// This is the core reverse-proxy operation.
 //
-// Flow:
-//   1. Create stream, register in streams map
-//   2. Send HEADERS(request meta)
-//   3. Send DATA frames (request body), last one with END_STREAM
-//   4. Wait for HEADERS(response meta) from edge
-//   5. Return response meta + response body reader
+// Flow control (Direction A: server→client request body):
+//
+//	Before sending each DATA chunk the server acquires n bytes from
+//	stream.sendWindowReq.  Credits are returned by the client via
+//	WINDOW_UPDATE(WinDirRequest) frames emitted from stream.ReqBodyReader()
+//	as the client's local handler reads the request body.
+//
+//	This ensures that stream.OnData (called from the client's readLoop) can
+//	always write to reqBody without blocking, which prevents a slow consumer
+//	on one stream from stalling all other streams on the connection.
 func (s *EdgeSession) DoRequest(
 	ctx context.Context,
 	streamID uint32,
@@ -84,87 +85,98 @@ func (s *EdgeSession) DoRequest(
 
 	stream := muxproto.NewStream(streamID, s.conn)
 
-	// Register stream so readLoop can dispatch frames to it.
 	s.mu.Lock()
 	s.streams[streamID] = stream
 	s.mu.Unlock()
 
-	defer func() {
-		// Cleanup happens after caller finishes reading response body.
-		// We defer removal but stream.Close() is called by caller or on error.
-	}()
+	cleanup := func() {
+		s.removeStream(streamID)
+		stream.Close()
+	}
 
 	// Send request headers.
 	if err := stream.SendHeaders(reqMeta, 0); err != nil {
-		s.removeStream(streamID)
-		stream.Close()
+		cleanup()
 		return nil, nil, fmt.Errorf("send request headers: %w", err)
 	}
 
-	// Send request body.
-	if reqBody != nil {
-		buf := make([]byte, muxproto.DataChunkSize)
-		for {
-			n, err := reqBody.Read(buf)
-			if n > 0 {
-				var flags muxproto.Flags
-				if err != nil { // EOF or error → last chunk
-					flags = muxproto.FlagEndStream
-				}
-				if sendErr := stream.SendData(buf[:n], flags); sendErr != nil {
-					s.removeStream(streamID)
-					stream.Close()
-					return nil, nil, fmt.Errorf("send request body: %w", sendErr)
-				}
-			}
-			if err != nil {
-				if n == 0 {
-					// Send empty END_STREAM if EOF with no data
-					if sendErr := stream.SendData(nil, muxproto.FlagEndStream); sendErr != nil {
-						s.removeStream(streamID)
-						stream.Close()
-						return nil, nil, fmt.Errorf("send end stream: %w", sendErr)
-					}
-				}
-				break
-			}
-		}
-	} else {
-		// No body — send empty DATA with END_STREAM.
-		if err := stream.SendData(nil, muxproto.FlagEndStream); err != nil {
-			s.removeStream(streamID)
-			stream.Close()
-			return nil, nil, fmt.Errorf("send end stream: %w", err)
-		}
+	// Send request body with per-chunk window acquisition.
+	if err := s.sendBodyWithFlowControl(ctx, stream, reqBody, true); err != nil {
+		cleanup()
+		return nil, nil, err
 	}
 
 	// Wait for response headers from edge.
 	select {
 	case <-ctx.Done():
 		stream.SendRST("caller cancelled") //nolint:errcheck
-		s.removeStream(streamID)
-		stream.Close()
+		cleanup()
 		return nil, nil, ctx.Err()
 	case <-s.ctx.Done():
-		s.removeStream(streamID)
-		stream.Close()
+		cleanup()
 		return nil, nil, fmt.Errorf("session closed")
 	case respMeta, ok := <-stream.RecvResponseHeadersChan():
 		if !ok || respMeta == nil {
-			s.removeStream(streamID)
-			stream.Close()
+			cleanup()
 			return nil, nil, fmt.Errorf("stream reset before response headers")
 		}
-		// Return response body as a reader. Caller is responsible for reading
-		// until EOF (which comes when the edge sends END_STREAM on response data).
-		// We wrap the pipe in a cleanup reader that removes the stream when done.
+		// Wrap respBody in a WindowUpdateReader (Direction B receiver).
+		// As the caller reads the response body, WINDOW_UPDATE(WinDirResponse)
+		// frames are sent back to the client, allowing it to send more chunks.
 		body := &streamCleanupReader{
-			reader:   stream.RespBody(),
+			reader:   stream.RespBodyReader(),
 			streamID: streamID,
 			stream:   stream,
 			session:  s,
 		}
 		return respMeta, body, nil
+	}
+}
+
+// sendBodyWithFlowControl sends DATA frames for reqBody (isRequest=true) or
+// respBody (isRequest=false), acquiring window credits before each chunk.
+//
+//   - isRequest=true  → acquires from sendWindowReq  (Direction A)
+//   - isRequest=false → acquires from sendWindowResp (Direction B, server side)
+func (s *EdgeSession) sendBodyWithFlowControl(
+	ctx context.Context,
+	stream *muxproto.Stream,
+	body io.Reader,
+	isRequest bool,
+) error {
+	if body == nil {
+		return stream.SendData(nil, muxproto.FlagEndStream)
+	}
+
+	buf := make([]byte, muxproto.DataChunkSize)
+	for {
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			var flags muxproto.Flags
+			if readErr != nil {
+				flags = muxproto.FlagEndStream
+			}
+
+			// Acquire window credit before sending.
+			var acquireErr error
+			if isRequest {
+				acquireErr = stream.AcquireReqWindow(ctx, int64(n))
+			}
+			// (server never sends response body in this flow — that's client side)
+			if acquireErr != nil {
+				return fmt.Errorf("window acquire: %w", acquireErr)
+			}
+
+			if sendErr := stream.SendData(buf[:n], flags); sendErr != nil {
+				return fmt.Errorf("send body DATA: %w", sendErr)
+			}
+		}
+		if readErr != nil {
+			if n == 0 {
+				return stream.SendData(nil, muxproto.FlagEndStream)
+			}
+			return nil // END_STREAM was set on the last chunk above
+		}
 	}
 }
 
@@ -174,10 +186,10 @@ func (s *EdgeSession) removeStream(id uint32) {
 	s.mu.Unlock()
 }
 
-// streamCleanupReader wraps the response body pipe and cleans up the stream
-// when the caller finishes reading (EOF or error).
+// streamCleanupReader wraps the response body reader and removes the stream
+// from the session map once the caller finishes consuming the response.
 type streamCleanupReader struct {
-	reader   *muxproto.StreamPipe
+	reader   io.Reader
 	streamID uint32
 	stream   *muxproto.Stream
 	session  *EdgeSession
@@ -213,12 +225,13 @@ func (s *EdgeSession) readLoop() {
 		}
 
 		switch {
-		// ── Control frames ───────────────────────────────────────────────
 		case f.StreamID == muxproto.ControlStreamID:
 			s.handleControlFrame(f)
 
-		// ── Request-response stream frames ───────────────────────────────
-		case f.Type == muxproto.TypeHeaders || f.Type == muxproto.TypeData || f.Type == muxproto.TypeRST:
+		case f.Type == muxproto.TypeHeaders ||
+			f.Type == muxproto.TypeData ||
+			f.Type == muxproto.TypeRST ||
+			f.Type == muxproto.TypeWindowUpdate:
 			s.handleStreamFrame(f)
 
 		default:
@@ -230,7 +243,7 @@ func (s *EdgeSession) readLoop() {
 func (s *EdgeSession) handleControlFrame(f *muxproto.Frame) {
 	switch f.Type {
 	case muxproto.TypePong:
-		// handled by pingLoop via timestamp (simplified)
+		// handled by pingLoop
 	case muxproto.TypePing:
 		s.conn.WriteFrame(&muxproto.Frame{Type: muxproto.TypePong}) //nolint:errcheck
 	default:
@@ -253,10 +266,25 @@ func (s *EdgeSession) handleStreamFrame(f *muxproto.Frame) {
 		if err := stream.OnHeaders(f); err != nil {
 			s.logger.Warn("stream headers error", "sid", f.StreamID, "err", err)
 		}
+
 	case muxproto.TypeData:
+		// OnData is non-blocking because flow control ensures the pipe has room.
 		if err := stream.OnData(f); err != nil {
-			s.logger.Warn("stream data error", "sid", f.StreamID, "err", err)
+			s.logger.Warn("stream data error — flow control violation, closing session",
+				"sid", f.StreamID, "err", err)
+			s.closeWithReason(fmt.Sprintf("flow control violation on stream %d", f.StreamID))
 		}
+
+	case muxproto.TypeWindowUpdate:
+		// Client consumed bytes from reqBody → credits for Direction A.
+		// Also handles Direction B if client is sending response body.
+		var msg muxproto.WindowUpdateMsg
+		if err := muxproto.Unmarshal(f.Payload, &msg); err != nil {
+			s.logger.Warn("bad WINDOW_UPDATE payload", "sid", f.StreamID, "err", err)
+			return
+		}
+		stream.OnWindowUpdate(msg.Dir, msg.Increment)
+
 	case muxproto.TypeRST:
 		var msg muxproto.RSTMsg
 		muxproto.Unmarshal(f.Payload, &msg) //nolint:errcheck
@@ -265,7 +293,6 @@ func (s *EdgeSession) handleStreamFrame(f *muxproto.Frame) {
 	}
 }
 
-// pingLoop sends periodic PING frames.
 func (s *EdgeSession) pingLoop() {
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
@@ -281,9 +308,7 @@ func (s *EdgeSession) pingLoop() {
 				return
 			}
 			s.conn.WriteFrame(&muxproto.Frame{Type: muxproto.TypePing}) //nolint:errcheck
-			// Simplified: we don't track pong separately since readLoop handles it.
-			// In production you'd use a pong channel like the mux_http version.
-			lastPong = time.Now() // optimistic; real impl should track actual pong
+			lastPong = time.Now() // optimistic; replace with pong channel in production
 		}
 	}
 }

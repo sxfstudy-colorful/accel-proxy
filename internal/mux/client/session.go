@@ -288,8 +288,9 @@ func (s *EdgeClientSession) readLoop(mc *muxproto.MuxConn) error {
 		case f.Type == muxproto.TypeHeaders && !s.hasReqStream(f.StreamID):
 			s.handleNewRequest(mc, f)
 
-		// Request-response stream: continuation frames
-		case f.Type == muxproto.TypeHeaders || f.Type == muxproto.TypeData || f.Type == muxproto.TypeRST:
+		// Request-response stream: continuation frames (including flow control)
+		case f.Type == muxproto.TypeHeaders || f.Type == muxproto.TypeData ||
+			f.Type == muxproto.TypeRST || f.Type == muxproto.TypeWindowUpdate:
 			s.dispatchReqStream(f)
 
 		default:
@@ -446,9 +447,32 @@ func (s *EdgeClientSession) dispatchReqStream(f *muxproto.Frame) {
 
 	switch f.Type {
 	case muxproto.TypeHeaders:
-		stream.OnHeaders(f) //nolint:errcheck
+		if err := stream.OnHeaders(f); err != nil {
+			s.logger.Warn("stream headers error", "sid", f.StreamID, "err", err)
+		}
+
 	case muxproto.TypeData:
-		stream.OnData(f) //nolint:errcheck
+		// Non-blocking because flow control keeps the pipe below capacity.
+		if err := stream.OnData(f); err != nil {
+			s.logger.Warn("stream data error — flow control violation",
+				"sid", f.StreamID, "err", err)
+			// Close the connection: sender violated the window protocol.
+			s.connMu.Lock()
+			if s.conn != nil {
+				s.conn.Close()
+			}
+			s.connMu.Unlock()
+		}
+
+	case muxproto.TypeWindowUpdate:
+		// Server consumed bytes from respBody → credits for Direction B.
+		var msg muxproto.WindowUpdateMsg
+		if err := muxproto.Unmarshal(f.Payload, &msg); err != nil {
+			s.logger.Warn("bad WINDOW_UPDATE payload", "sid", f.StreamID, "err", err)
+			return
+		}
+		stream.OnWindowUpdate(msg.Dir, msg.Increment)
+
 	case muxproto.TypeRST:
 		var msg muxproto.RSTMsg
 		muxproto.Unmarshal(f.Payload, &msg) //nolint:errcheck
@@ -473,7 +497,9 @@ func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
 		"sid", stream.ID, "method", reqMeta.Method,
 		"url", reqMeta.URL, "host", reqMeta.Host)
 
-	respMeta, respBody, err := s.reqHandler(s.ctx, reqMeta, stream.ReqBody())
+	// ReqBodyReader wraps reqBody and auto-sends WINDOW_UPDATE(WinDirRequest)
+	// as the handler reads bytes, replenishing the server's Direction-A window.
+	respMeta, respBody, err := s.reqHandler(s.ctx, reqMeta, stream.ReqBodyReader())
 	if err != nil {
 		s.logger.Error("handler error", "sid", stream.ID, "err", err)
 		stream.SendRST(fmt.Sprintf("handler error: %v", err)) //nolint:errcheck
@@ -498,6 +524,14 @@ func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
 				var flags muxproto.Flags
 				if readErr != nil {
 					flags = muxproto.FlagEndStream
+				}
+				// Acquire Direction-B window credit before sending.
+				// Server releases credits via WINDOW_UPDATE(WinDirResponse) as
+				// it reads from respBody via RespBodyReader().  This goroutine
+				// blocks here on a slow server consumer; readLoop is unaffected.
+				if wErr := stream.AcquireRespWindow(s.ctx, int64(n)); wErr != nil {
+					s.logger.Error("resp window acquire", "sid", stream.ID, "err", wErr)
+					return
 				}
 				if sendErr := stream.SendData(buf[:n], flags); sendErr != nil {
 					s.logger.Error("send resp body", "sid", stream.ID, "err", sendErr)

@@ -1,6 +1,7 @@
 package muxproto
 
 import (
+	"fmt"
 	"io"
 	"sync"
 )
@@ -130,4 +131,36 @@ func (p *StreamPipe) Available() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.size
+}
+
+// WriteNonBlock writes data into the pipe without blocking.
+// Returns ErrPipeFull if there is not enough space.
+// Used by OnData: with flow control the pipe should always have room,
+// so a full pipe indicates a protocol violation by the remote sender.
+var ErrPipeFull = fmt.Errorf("stream pipe full: flow control violated")
+
+func (p *StreamPipe) WriteNonBlock(data []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return 0, io.ErrClosedPipe
+	}
+	avail := p.cap - p.size
+	if len(data) > avail {
+		return 0, ErrPipeFull
+	}
+
+	n := len(data)
+	first := p.cap - p.tail
+	if first >= n {
+		copy(p.buf[p.tail:], data)
+	} else {
+		copy(p.buf[p.tail:], data[:first])
+		copy(p.buf[0:], data[first:])
+	}
+	p.tail = (p.tail + n) % p.cap
+	p.size += n
+	p.notEmpty.Broadcast()
+	return n, nil
 }
