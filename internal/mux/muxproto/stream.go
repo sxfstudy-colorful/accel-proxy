@@ -2,58 +2,33 @@ package muxproto
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 )
 
-// Stream represents one bidirectional request-response stream.
+// Stream represents one bidirectional request-response stream with per-direction
+// flow control.
 //
-// A stream has two phases:
-//
-//	Phase 1: Server sends HEADERS + DATA (request body) → client
-//	Phase 2: Client sends HEADERS + DATA (response body) → server
-//
-// Flow control (per direction):
-//
-//	Direction A (req body, server→client):
-//	  Server tracks sendWindowReq.  Before sending each DATA chunk the server
-//	  calls AcquireReqWindow(n).  When the client reads from ReqBody it sends
-//	  a WINDOW_UPDATE(WinDirRequest, n), which calls OnWindowUpdate and
-//	  releases the credits so the server can proceed.
-//
-//	Direction B (resp body, client→server):
-//	  Client tracks sendWindowResp.  Same mechanism, roles swapped.
-//
-// Both windows are initialised to pipeBufSize so the remote StreamPipe can
-// always absorb the maximum in-flight bytes without blocking the readLoop.
+// Flow control prevents a slow consumer on one stream from blocking all other
+// streams on the same connection.  Each direction has a send window (credit
+// tracker) and the receiver sends WINDOW_UPDATE frames as it consumes bytes.
 type Stream struct {
 	ID   uint32
 	conn *MuxConn
 
-	// reqHeaders/respHeaders deliver parsed metadata frames.
 	reqHeaders  chan *RequestMeta
 	respHeaders chan *ResponseMeta
 
-	// reqBody  — request body pipe  (server writes, client reads)
-	// respBody — response body pipe (client writes, server reads)
-	reqBody  *StreamPipe
-	respBody *StreamPipe
+	reqBody  *StreamPipe // server writes, client reads
+	respBody *StreamPipe // client writes, server reads
 
-	// phase: 0 = request direction active, 1 = response direction active.
-	phase atomic.Int32
+	phase atomic.Int32 // 0 = request, 1 = response
 
-	// sendWindowReq — server-side send window for Direction A.
-	// AcquireReqWindow blocks the server goroutine until credits are available.
-	// Released by OnWindowUpdate(WinDirRequest, n) which is driven by the
-	// client's windowUpdateReader as it consumes bytes from reqBody.
-	sendWindowReq *windowTracker
-
-	// sendWindowResp — client-side send window for Direction B.
-	// AcquireRespWindow blocks the client goroutine.
-	// Released by OnWindowUpdate(WinDirResponse, n) driven by the server's
-	// windowUpdateReader as it consumes bytes from respBody.
-	sendWindowResp *windowTracker
+	sendWindowReq  *windowTracker // server→client send window (Direction A)
+	sendWindowResp *windowTracker // client→server send window (Direction B)
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -64,9 +39,12 @@ const (
 	phaseResponse = 1
 	pipeBufSize   = 512 * 1024 // 512 KiB per direction
 
-	// windowUpdateBatch: minimum bytes consumed before sending a WINDOW_UPDATE.
-	// Batching prevents a flood of tiny frames on small reads.
-	windowUpdateBatch = 32 * 1024 // 32 KiB
+	// windowUpdateBatch: minimum bytes consumed before sending WINDOW_UPDATE.
+	windowUpdateBatch = 32 * 1024
+
+	// Binary WINDOW_UPDATE payload size: 4(increment) + 1(dir) = 5 bytes.
+	// StreamID is taken from the frame header, not duplicated in payload.
+	winUpdatePayloadSize = 5
 )
 
 func NewStream(id uint32, conn *MuxConn) *Stream {
@@ -84,12 +62,12 @@ func NewStream(id uint32, conn *MuxConn) *Stream {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// windowTracker — per-direction send-window bookkeeping
+// windowTracker — per-direction send-window credit tracker
 // ─────────────────────────────────────────────────────────────────────────────
 
 type windowTracker struct {
-	mu    sync.Mutex
-	cond  *sync.Cond
+	mu   sync.Mutex
+	cond *sync.Cond
 	avail int64
 }
 
@@ -99,11 +77,20 @@ func newWindowTracker(initial int64) *windowTracker {
 	return wt
 }
 
-// Acquire blocks until n bytes of send credit are available (or ctx/closed
-// fires).  It subtracts n from the available window atomically on success.
+// Acquire blocks until n bytes of credit are available, then subtracts n.
+// Optimized: fast path avoids spawning a watcher goroutine when credits are
+// already available (common case under normal load).
 func (wt *windowTracker) Acquire(ctx context.Context, n int64, closed <-chan struct{}) error {
-	// Watcher goroutine: wake the cond when ctx/closed fires so the Wait
-	// loop can check exit conditions without busy-spinning.
+	// Fast path: credits available — no goroutine needed.
+	wt.mu.Lock()
+	if wt.avail >= n {
+		wt.avail -= n
+		wt.mu.Unlock()
+		return nil
+	}
+	wt.mu.Unlock()
+
+	// Slow path: need to wait. Spawn watcher for ctx/closed cancellation.
 	quit := make(chan struct{})
 	go func() {
 		select {
@@ -133,8 +120,6 @@ func (wt *windowTracker) Acquire(ctx context.Context, n int64, closed <-chan str
 	return nil
 }
 
-// Release adds n bytes back to the available window and wakes any waiter.
-// Called from OnWindowUpdate — must not block.
 func (wt *windowTracker) Release(n int64) {
 	wt.mu.Lock()
 	wt.avail += n
@@ -142,7 +127,6 @@ func (wt *windowTracker) Release(n int64) {
 	wt.mu.Unlock()
 }
 
-// WakeAll wakes all waiters without changing the window (used on stream close).
 func (wt *windowTracker) WakeAll() {
 	wt.mu.Lock()
 	wt.cond.Broadcast()
@@ -159,7 +143,7 @@ func isClosed(ch <-chan struct{}) bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Dispatcher methods — called by the readLoop (must not block)
+// Dispatcher methods — called by readLoop (must not block)
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (s *Stream) OnHeaders(f *Frame) error {
@@ -185,13 +169,7 @@ func (s *Stream) OnHeaders(f *Frame) error {
 	return nil
 }
 
-// OnData is called by the readLoop when a DATA frame arrives.
-//
-// Because we use per-stream flow control (sendWindowReq / sendWindowResp),
-// the remote sender only transmits as many bytes as the local pipe can hold.
-// Therefore StreamPipe.Write should never block here — if it does it means
-// the sender violated the window protocol, and we return an error to let the
-// readLoop close the session.
+// OnData writes incoming body data into the appropriate pipe (non-blocking).
 func (s *Stream) OnData(f *Frame) error {
 	phase := s.phase.Load()
 	var pipe *StreamPipe
@@ -215,20 +193,22 @@ func (s *Stream) OnData(f *Frame) error {
 	return nil
 }
 
-// OnRST is called when the peer resets this stream.
 func (s *Stream) OnRST(reason string) {
 	err := fmt.Errorf("%w: %s", ErrStreamReset, reason)
 	s.reqBody.CloseWrite(err)
 	s.respBody.CloseWrite(err)
-	// Wake any goroutine blocked in AcquireReqWindow / AcquireRespWindow.
 	s.sendWindowReq.WakeAll()
 	s.sendWindowResp.WakeAll()
 	s.Close()
 }
 
-// OnWindowUpdate is called by the dispatcher when a WINDOW_UPDATE frame
-// arrives for this stream.  Must not block.
-func (s *Stream) OnWindowUpdate(dir WinDir, increment int32) {
+// OnWindowUpdate handles binary-encoded WINDOW_UPDATE payload.
+func (s *Stream) OnWindowUpdate(payload []byte) {
+	if len(payload) < winUpdatePayloadSize {
+		return
+	}
+	increment := int32(binary.BigEndian.Uint32(payload[0:4]))
+	dir := WinDir(payload[4])
 	if dir == WinDirRequest {
 		s.sendWindowReq.Release(int64(increment))
 	} else {
@@ -237,7 +217,7 @@ func (s *Stream) OnWindowUpdate(dir WinDir, increment int32) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Consumer / sender methods
+// Consumer methods
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (s *Stream) RecvRequestHeaders() (*RequestMeta, error) {
@@ -262,47 +242,23 @@ func (s *Stream) RecvResponseHeadersChan() <-chan *ResponseMeta {
 	return s.respHeaders
 }
 
-// ReqBody returns the raw request-body pipe.
-// Prefer ReqBodyReader which auto-sends WINDOW_UPDATE as bytes are consumed.
-func (s *Stream) ReqBody() *StreamPipe { return s.reqBody }
-
-// RespBody returns the raw response-body pipe.
-// Prefer RespBodyReader which auto-sends WINDOW_UPDATE as bytes are consumed.
+func (s *Stream) ReqBody() *StreamPipe  { return s.reqBody }
 func (s *Stream) RespBody() *StreamPipe { return s.respBody }
 
-// ReqBodyReader returns an io.Reader wrapping reqBody that automatically sends
-// WINDOW_UPDATE(WinDirRequest) frames as bytes are consumed.  The server's
-// send window is replenished in real time, keeping the pipeline full without
-// over-filling the local pipe.
+// ReqBodyReader returns a reader that auto-sends WINDOW_UPDATE(WinDirRequest).
 func (s *Stream) ReqBodyReader() *WindowUpdateReader {
-	return &WindowUpdateReader{
-		pipe: s.reqBody,
-		conn: s.conn,
-		sid:  s.ID,
-		dir:  WinDirRequest,
-	}
+	return &WindowUpdateReader{pipe: s.reqBody, conn: s.conn, sid: s.ID, dir: WinDirRequest}
 }
 
-// RespBodyReader returns an io.Reader wrapping respBody that automatically
-// sends WINDOW_UPDATE(WinDirResponse) frames as bytes are consumed.
+// RespBodyReader returns a reader that auto-sends WINDOW_UPDATE(WinDirResponse).
 func (s *Stream) RespBodyReader() *WindowUpdateReader {
-	return &WindowUpdateReader{
-		pipe: s.respBody,
-		conn: s.conn,
-		sid:  s.ID,
-		dir:  WinDirResponse,
-	}
+	return &WindowUpdateReader{pipe: s.respBody, conn: s.conn, sid: s.ID, dir: WinDirResponse}
 }
 
-// AcquireReqWindow blocks the calling goroutine until n bytes of Direction-A
-// send credit are available, then subtracts n from the window.
-// Used by the server before sending each request-body DATA chunk.
 func (s *Stream) AcquireReqWindow(ctx context.Context, n int64) error {
 	return s.sendWindowReq.Acquire(ctx, n, s.closed)
 }
 
-// AcquireRespWindow blocks until n bytes of Direction-B send credit are
-// available.  Used by the client before sending each response-body DATA chunk.
 func (s *Stream) AcquireRespWindow(ctx context.Context, n int64) error {
 	return s.sendWindowResp.Acquire(ctx, n, s.closed)
 }
@@ -313,28 +269,63 @@ func (s *Stream) AcquireRespWindow(ctx context.Context, n int64) error {
 
 func (s *Stream) SendHeaders(meta any, flags Flags) error {
 	return s.conn.WriteFrame(&Frame{
-		StreamID: s.ID,
-		Type:     TypeHeaders,
-		Flags:    flags,
-		Payload:  Marshal(meta),
+		StreamID: s.ID, Type: TypeHeaders, Flags: flags, Payload: Marshal(meta),
 	})
 }
 
 func (s *Stream) SendData(data []byte, flags Flags) error {
 	return s.conn.WriteFrame(&Frame{
-		StreamID: s.ID,
-		Type:     TypeData,
-		Flags:    flags,
-		Payload:  data,
+		StreamID: s.ID, Type: TypeData, Flags: flags, Payload: data,
 	})
 }
 
 func (s *Stream) SendRST(reason string) error {
 	return s.conn.WriteFrame(&Frame{
-		StreamID: s.ID,
-		Type:     TypeRST,
-		Payload:  Marshal(RSTMsg{Reason: reason}),
+		StreamID: s.ID, Type: TypeRST, Payload: Marshal(RSTMsg{Reason: reason}),
 	})
+}
+
+// SendBodyWithFlowControl reads from body and sends DATA frames with per-chunk
+// window acquisition. dir selects which window to acquire from.
+// Extracted as a Stream method to eliminate code duplication between server and client.
+func (s *Stream) SendBodyWithFlowControl(ctx context.Context, body io.Reader, dir WinDir) error {
+	if body == nil {
+		return s.SendData(nil, FlagEndStream)
+	}
+
+	buf := chunkBufPool.Get().([]byte)
+	defer chunkBufPool.Put(buf)
+
+	for {
+		n, readErr := body.Read(buf)
+		if n > 0 {
+			var flags Flags
+			if readErr != nil {
+				flags = FlagEndStream
+			}
+
+			// Acquire window credit before sending.
+			var acquireErr error
+			if dir == WinDirRequest {
+				acquireErr = s.AcquireReqWindow(ctx, int64(n))
+			} else {
+				acquireErr = s.AcquireRespWindow(ctx, int64(n))
+			}
+			if acquireErr != nil {
+				return fmt.Errorf("window acquire: %w", acquireErr)
+			}
+
+			if sendErr := s.SendData(buf[:n], flags); sendErr != nil {
+				return fmt.Errorf("send body DATA: %w", sendErr)
+			}
+		}
+		if readErr != nil {
+			if n == 0 {
+				return s.SendData(nil, FlagEndStream)
+			}
+			return nil
+		}
+	}
 }
 
 func (s *Stream) Close() {
@@ -348,29 +339,21 @@ func (s *Stream) Close() {
 func (s *Stream) Done() <-chan struct{} { return s.closed }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WindowUpdateReader — sends WINDOW_UPDATE as bytes are consumed
+// WindowUpdateReader — sends binary WINDOW_UPDATE as bytes are consumed
 // ─────────────────────────────────────────────────────────────────────────────
 
-// WindowUpdateReader wraps a StreamPipe and sends batched WINDOW_UPDATE frames
-// as bytes are read, replenishing the remote sender's window in real time.
-//
-// This is the key mechanism that prevents the readLoop from blocking:
-//
-//	readLoop reads DATA frame → OnData writes to pipe (non-blocking, window ensures room)
-//	Consumer reads from WindowUpdateReader → sends WINDOW_UPDATE → server sends more
 type WindowUpdateReader struct {
 	pipe       *StreamPipe
 	conn       *MuxConn
 	sid        uint32
 	dir        WinDir
-	pendingInc int32 // bytes consumed since last WINDOW_UPDATE
+	pendingInc int32
 }
 
 func (r *WindowUpdateReader) Read(p []byte) (int, error) {
 	n, err := r.pipe.Read(p)
 	if n > 0 {
 		r.pendingInc += int32(n)
-		// Flush WINDOW_UPDATE when we've accumulated enough or on stream end.
 		if r.pendingInc >= windowUpdateBatch || err != nil {
 			r.flush()
 		}
@@ -382,14 +365,27 @@ func (r *WindowUpdateReader) flush() {
 	if r.pendingInc <= 0 {
 		return
 	}
-	r.conn.WriteFrame(&Frame{ //nolint:errcheck
+	// Binary encode: 4(increment) + 1(dir) = 5 bytes.
+	var payload [winUpdatePayloadSize]byte
+	binary.BigEndian.PutUint32(payload[0:4], uint32(r.pendingInc))
+	payload[4] = byte(r.dir)
+
+	if err := r.conn.WriteFrame(&Frame{
 		StreamID: r.sid,
 		Type:     TypeWindowUpdate,
-		Payload: Marshal(WindowUpdateMsg{
-			StreamID:  r.sid,
-			Increment: r.pendingInc,
-			Dir:       r.dir,
-		}),
-	})
+		Payload:  payload[:],
+	}); err != nil {
+		// Don't clear pendingInc — connection is likely dead.
+		// The session's readLoop will detect the broken connection and clean up.
+		return
+	}
 	r.pendingInc = 0
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared pool for DATA chunk buffers (32 KiB)
+// ─────────────────────────────────────────────────────────────────────────────
+
+var chunkBufPool = sync.Pool{
+	New: func() any { return make([]byte, DataChunkSize) },
 }

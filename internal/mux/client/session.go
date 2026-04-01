@@ -30,9 +30,7 @@ const (
 // RequestHandler is called for each reverse-proxy request pushed by the server.
 type RequestHandler func(ctx context.Context, req *muxproto.RequestMeta, body io.Reader) (*muxproto.ResponseMeta, io.Reader, error)
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Push stream receive state
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Push stream receive state ───────────────────────────────────────────────
 
 type pushRecvState struct {
 	name        string
@@ -42,9 +40,7 @@ type pushRecvState struct {
 	buf         *RecvBuffer
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// EdgeClientSession — unified client supporting push streams + reverse proxy
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── EdgeClientSession ──────────────────────────────────────────────────────
 
 type EdgeClientSession struct {
 	nodeID     string
@@ -53,12 +49,10 @@ type EdgeClientSession struct {
 	reqHandler RequestHandler
 	logger     *slog.Logger
 
-	// Push stream state (keyed by name, rebuilt on connect)
-	pushStreams    map[string]*pushRecvState
-	pushByID      map[uint32]*pushRecvState
-	pushIDMu      sync.RWMutex
+	pushStreams map[string]*pushRecvState
+	pushByID   map[uint32]*pushRecvState
+	pushIDMu   sync.RWMutex
 
-	// Request-response streams (keyed by stream ID)
 	reqStreams   map[uint32]*muxproto.Stream
 	reqStreamMu sync.RWMutex
 
@@ -71,11 +65,6 @@ type EdgeClientSession struct {
 	cancel context.CancelFunc
 }
 
-// NewEdgeClientSession creates a session that supports:
-//   - push stream subscriptions (pushSubs)
-//   - reverse-proxied HTTP requests (reqHandler)
-//
-// At least one of pushSubs or reqHandler must be provided.
 func NewEdgeClientSession(
 	nodeID, accessAddr string,
 	pushSubs []string,
@@ -114,7 +103,6 @@ func (s *EdgeClientSession) Close() {
 	s.connMu.Unlock()
 }
 
-// StreamReader returns an io.Reader for the named push stream.
 func (s *EdgeClientSession) StreamReader(name string) io.Reader {
 	if st, ok := s.pushStreams[name]; ok {
 		return st.buf
@@ -122,7 +110,6 @@ func (s *EdgeClientSession) StreamReader(name string) io.Reader {
 	return nil
 }
 
-// ResumeOffset returns the byte offset a push stream has received so far.
 func (s *EdgeClientSession) ResumeOffset(name string) int64 {
 	if st, ok := s.pushStreams[name]; ok {
 		return st.recvOffset.Load()
@@ -130,10 +117,8 @@ func (s *EdgeClientSession) ResumeOffset(name string) int64 {
 	return 0
 }
 
-// PushSubs returns the list of push stream names.
 func (s *EdgeClientSession) PushSubs() []string { return s.pushSubs }
 
-// Run connects, registers, and reconnects with exponential back-off.
 func (s *EdgeClientSession) Run() {
 	backoff := reconnectBase
 	for !s.closed.Load() {
@@ -157,7 +142,6 @@ func (s *EdgeClientSession) Run() {
 }
 
 func (s *EdgeClientSession) runOnce() error {
-	// Reopen any closed push buffers from previous cycle.
 	for _, st := range s.pushStreams {
 		if st.buf.IsClosed() {
 			st.buf.Reopen()
@@ -183,7 +167,7 @@ func (s *EdgeClientSession) runOnce() error {
 		s.connMu.Unlock()
 	}()
 
-	// 1. Build and send REGISTER
+	// Build capabilities.
 	var caps []string
 	if s.reqHandler != nil {
 		caps = append(caps, "reverse-http")
@@ -212,7 +196,6 @@ func (s *EdgeClientSession) runOnce() error {
 		return fmt.Errorf("write REGISTER: %w", err)
 	}
 
-	// 2. Read REGISTER_ACK
 	f, err := mc.ReadFrame()
 	if err != nil {
 		return fmt.Errorf("read REGISTER_ACK: %w", err)
@@ -225,7 +208,6 @@ func (s *EdgeClientSession) runOnce() error {
 		return fmt.Errorf("registration rejected: %s", ack.Message)
 	}
 
-	// Rebuild push stream ID mappings.
 	byID := make(map[uint32]*pushRecvState, len(ack.PushStreamIDs))
 	for name, id := range ack.PushStreamIDs {
 		if st, ok := s.pushStreams[name]; ok {
@@ -239,7 +221,6 @@ func (s *EdgeClientSession) runOnce() error {
 
 	s.logger.Info("registered", "push_sids", ack.PushStreamIDs, "caps", caps)
 
-	// 3. Start background goroutines
 	ackStop := make(chan struct{})
 	if len(s.pushSubs) > 0 {
 		go s.ackLoop(mc, ackStop)
@@ -252,13 +233,10 @@ func (s *EdgeClientSession) runOnce() error {
 	go s.pingLoop(mc, pingStop, pongCh)
 	defer close(pingStop)
 
-	// 4. Read loop
 	return s.readLoop(mc)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Frame dispatch
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Frame dispatch ──────────────────────────────────────────────────────────
 
 func (s *EdgeClientSession) readLoop(mc *muxproto.MuxConn) error {
 	for {
@@ -274,21 +252,18 @@ func (s *EdgeClientSession) readLoop(mc *muxproto.MuxConn) error {
 		}
 
 		switch {
-		// Control frames
 		case f.StreamID == muxproto.ControlStreamID:
-			s.handleControl(f)
+			// FIX: pass mc directly — readLoop already has it, no need to lock connMu.
+			s.handleControl(mc, f)
 
-		// Push stream frames
 		case f.Type == muxproto.TypePushData:
 			s.handlePushData(f)
 		case f.Type == muxproto.TypePushRST:
 			s.handlePushRST(f)
 
-		// Request-response stream: first HEADERS = new request from server
 		case f.Type == muxproto.TypeHeaders && !s.hasReqStream(f.StreamID):
 			s.handleNewRequest(mc, f)
 
-		// Request-response stream: continuation frames (including flow control)
 		case f.Type == muxproto.TypeHeaders || f.Type == muxproto.TypeData ||
 			f.Type == muxproto.TypeRST || f.Type == muxproto.TypeWindowUpdate:
 			s.dispatchReqStream(f)
@@ -299,15 +274,11 @@ func (s *EdgeClientSession) readLoop(mc *muxproto.MuxConn) error {
 	}
 }
 
-func (s *EdgeClientSession) handleControl(f *muxproto.Frame) {
+// FIX: takes mc parameter directly instead of locking connMu.
+func (s *EdgeClientSession) handleControl(mc *muxproto.MuxConn, f *muxproto.Frame) {
 	switch f.Type {
 	case muxproto.TypePing:
-		s.connMu.Lock()
-		mc := s.conn
-		s.connMu.Unlock()
-		if mc != nil {
-			mc.WriteFrame(&muxproto.Frame{Type: muxproto.TypePong}) //nolint:errcheck
-		}
+		mc.WriteFrame(&muxproto.Frame{Type: muxproto.TypePong}) //nolint:errcheck
 	case muxproto.TypePong:
 		select {
 		case s.pongCh <- struct{}{}:
@@ -320,9 +291,7 @@ func (s *EdgeClientSession) handleControl(f *muxproto.Frame) {
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Push stream handling
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Push stream handling ────────────────────────────────────────────────────
 
 func (s *EdgeClientSession) handlePushData(f *muxproto.Frame) {
 	s.pushIDMu.RLock()
@@ -398,9 +367,7 @@ func (s *EdgeClientSession) ackLoop(mc *muxproto.MuxConn, stop <-chan struct{}) 
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Request-response stream handling
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Request-response stream handling ────────────────────────────────────────
 
 func (s *EdgeClientSession) hasReqStream(id uint32) bool {
 	s.reqStreamMu.RLock()
@@ -411,7 +378,7 @@ func (s *EdgeClientSession) hasReqStream(id uint32) bool {
 
 func (s *EdgeClientSession) handleNewRequest(mc *muxproto.MuxConn, f *muxproto.Frame) {
 	if s.reqHandler == nil {
-		s.logger.Warn("received request but no handler configured", "sid", f.StreamID)
+		s.logger.Warn("received request but no handler", "sid", f.StreamID)
 		mc.WriteFrame(&muxproto.Frame{ //nolint:errcheck
 			StreamID: f.StreamID,
 			Type:     muxproto.TypeRST,
@@ -425,7 +392,6 @@ func (s *EdgeClientSession) handleNewRequest(mc *muxproto.MuxConn, f *muxproto.F
 	s.reqStreams[f.StreamID] = stream
 	s.reqStreamMu.Unlock()
 
-	// Parse first HEADERS frame.
 	if err := stream.OnHeaders(f); err != nil {
 		s.logger.Warn("bad request headers", "sid", f.StreamID, "err", err)
 		stream.SendRST("bad headers") //nolint:errcheck
@@ -447,31 +413,30 @@ func (s *EdgeClientSession) dispatchReqStream(f *muxproto.Frame) {
 
 	switch f.Type {
 	case muxproto.TypeHeaders:
-		if err := stream.OnHeaders(f); err != nil {
-			s.logger.Warn("stream headers error", "sid", f.StreamID, "err", err)
-		}
+		stream.OnHeaders(f) //nolint:errcheck
 
 	case muxproto.TypeData:
-		// Non-blocking because flow control keeps the pipe below capacity.
 		if err := stream.OnData(f); err != nil {
 			s.logger.Warn("stream data error — flow control violation",
 				"sid", f.StreamID, "err", err)
-			// Close the connection: sender violated the window protocol.
+			// FIX: send GOAWAY before closing so server knows why.
 			s.connMu.Lock()
-			if s.conn != nil {
-				s.conn.Close()
-			}
+			mc := s.conn
 			s.connMu.Unlock()
+			if mc != nil {
+				mc.WriteFrame(&muxproto.Frame{ //nolint:errcheck
+					Type:    muxproto.TypeGoAway,
+					Payload: muxproto.Marshal(muxproto.GoAwayMsg{
+						Reason: fmt.Sprintf("flow control violation on stream %d", f.StreamID),
+					}),
+				})
+				mc.Close()
+			}
 		}
 
 	case muxproto.TypeWindowUpdate:
-		// Server consumed bytes from respBody → credits for Direction B.
-		var msg muxproto.WindowUpdateMsg
-		if err := muxproto.Unmarshal(f.Payload, &msg); err != nil {
-			s.logger.Warn("bad WINDOW_UPDATE payload", "sid", f.StreamID, "err", err)
-			return
-		}
-		stream.OnWindowUpdate(msg.Dir, msg.Increment)
+		// Binary-encoded payload: 4(increment) + 1(dir).
+		stream.OnWindowUpdate(f.Payload)
 
 	case muxproto.TypeRST:
 		var msg muxproto.RSTMsg
@@ -481,8 +446,15 @@ func (s *EdgeClientSession) dispatchReqStream(f *muxproto.Frame) {
 	}
 }
 
+// serveRequest handles one server-pushed HTTP request.
+// FIX: panic recovery to prevent handler panics from leaking streams.
 func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
 	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("serveRequest panic recovered",
+				"sid", stream.ID, "panic", fmt.Sprintf("%v", r))
+			stream.SendRST("internal error") //nolint:errcheck
+		}
 		s.removeReqStream(stream.ID)
 		stream.Close()
 	}()
@@ -497,8 +469,7 @@ func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
 		"sid", stream.ID, "method", reqMeta.Method,
 		"url", reqMeta.URL, "host", reqMeta.Host)
 
-	// ReqBodyReader wraps reqBody and auto-sends WINDOW_UPDATE(WinDirRequest)
-	// as the handler reads bytes, replenishing the server's Direction-A window.
+	// ReqBodyReader auto-sends WINDOW_UPDATE(WinDirRequest) as handler reads.
 	respMeta, respBody, err := s.reqHandler(s.ctx, reqMeta, stream.ReqBodyReader())
 	if err != nil {
 		s.logger.Error("handler error", "sid", stream.ID, "err", err)
@@ -506,44 +477,19 @@ func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
 		return
 	}
 
-	// Send response headers.
 	if err := stream.SendHeaders(respMeta, 0); err != nil {
 		s.logger.Error("send resp headers", "sid", stream.ID, "err", err)
 		return
 	}
 
-	// Send response body.
+	// Send response body with flow control (Direction B).
 	if respBody != nil {
 		if closer, ok := respBody.(io.Closer); ok {
 			defer closer.Close()
 		}
-		buf := make([]byte, muxproto.DataChunkSize)
-		for {
-			n, readErr := respBody.Read(buf)
-			if n > 0 {
-				var flags muxproto.Flags
-				if readErr != nil {
-					flags = muxproto.FlagEndStream
-				}
-				// Acquire Direction-B window credit before sending.
-				// Server releases credits via WINDOW_UPDATE(WinDirResponse) as
-				// it reads from respBody via RespBodyReader().  This goroutine
-				// blocks here on a slow server consumer; readLoop is unaffected.
-				if wErr := stream.AcquireRespWindow(s.ctx, int64(n)); wErr != nil {
-					s.logger.Error("resp window acquire", "sid", stream.ID, "err", wErr)
-					return
-				}
-				if sendErr := stream.SendData(buf[:n], flags); sendErr != nil {
-					s.logger.Error("send resp body", "sid", stream.ID, "err", sendErr)
-					return
-				}
-			}
-			if readErr != nil {
-				if n == 0 {
-					stream.SendData(nil, muxproto.FlagEndStream) //nolint:errcheck
-				}
-				break
-			}
+		if err := stream.SendBodyWithFlowControl(s.ctx, respBody, muxproto.WinDirResponse); err != nil {
+			s.logger.Error("send resp body", "sid", stream.ID, "err", err)
+			return
 		}
 	} else {
 		stream.SendData(nil, muxproto.FlagEndStream) //nolint:errcheck
@@ -556,9 +502,7 @@ func (s *EdgeClientSession) removeReqStream(id uint32) {
 	s.reqStreamMu.Unlock()
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Keepalive
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Keepalive ───────────────────────────────────────────────────────────────
 
 func (s *EdgeClientSession) pingLoop(mc *muxproto.MuxConn, stop <-chan struct{}, pongCh <-chan struct{}) {
 	ticker := time.NewTicker(clientPingInterval)
@@ -584,12 +528,8 @@ func (s *EdgeClientSession) pingLoop(mc *muxproto.MuxConn, stop <-chan struct{},
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Default request handler: forward to local HTTP backend
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Default request handler ─────────────────────────────────────────────────
 
-// NewHTTPProxyHandler returns a RequestHandler that forwards requests to the
-// given backend URL (e.g. "http://127.0.0.1:8080").
 func NewHTTPProxyHandler(backendBaseURL string, logger *slog.Logger) RequestHandler {
 	httpClient := &http.Client{
 		Timeout: 60 * time.Second,

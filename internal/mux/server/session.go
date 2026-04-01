@@ -25,6 +25,9 @@ type EdgeSession struct {
 	mu      sync.RWMutex
 	streams map[uint32]*muxproto.Stream
 
+	// pongCh carries pong signals from readLoop to pingLoop.
+	pongCh chan struct{}
+
 	once sync.Once
 }
 
@@ -47,6 +50,7 @@ func newEdgeSession(nodeID string, conn *muxproto.MuxConn, srv *Server, logger *
 		ctx:     ctx,
 		cancel:  cancel,
 		streams: make(map[uint32]*muxproto.Stream),
+		pongCh:  make(chan struct{}, 4),
 	}
 }
 
@@ -65,17 +69,6 @@ func (s *EdgeSession) closeWithReason(reason string) {
 }
 
 // DoRequest pushes an HTTP request to the edge and waits for the response.
-//
-// Flow control (Direction A: server→client request body):
-//
-//	Before sending each DATA chunk the server acquires n bytes from
-//	stream.sendWindowReq.  Credits are returned by the client via
-//	WINDOW_UPDATE(WinDirRequest) frames emitted from stream.ReqBodyReader()
-//	as the client's local handler reads the request body.
-//
-//	This ensures that stream.OnData (called from the client's readLoop) can
-//	always write to reqBody without blocking, which prevents a slow consumer
-//	on one stream from stalling all other streams on the connection.
 func (s *EdgeSession) DoRequest(
 	ctx context.Context,
 	streamID uint32,
@@ -100,8 +93,8 @@ func (s *EdgeSession) DoRequest(
 		return nil, nil, fmt.Errorf("send request headers: %w", err)
 	}
 
-	// Send request body with per-chunk window acquisition.
-	if err := s.sendBodyWithFlowControl(ctx, stream, reqBody, true); err != nil {
+	// Send request body with per-chunk flow control (Direction A).
+	if err := stream.SendBodyWithFlowControl(ctx, reqBody, muxproto.WinDirRequest); err != nil {
 		cleanup()
 		return nil, nil, err
 	}
@@ -120,9 +113,7 @@ func (s *EdgeSession) DoRequest(
 			cleanup()
 			return nil, nil, fmt.Errorf("stream reset before response headers")
 		}
-		// Wrap respBody in a WindowUpdateReader (Direction B receiver).
-		// As the caller reads the response body, WINDOW_UPDATE(WinDirResponse)
-		// frames are sent back to the client, allowing it to send more chunks.
+		// Wrap respBody in WindowUpdateReader (Direction B receiver).
 		body := &streamCleanupReader{
 			reader:   stream.RespBodyReader(),
 			streamID: streamID,
@@ -133,61 +124,12 @@ func (s *EdgeSession) DoRequest(
 	}
 }
 
-// sendBodyWithFlowControl sends DATA frames for reqBody (isRequest=true) or
-// respBody (isRequest=false), acquiring window credits before each chunk.
-//
-//   - isRequest=true  → acquires from sendWindowReq  (Direction A)
-//   - isRequest=false → acquires from sendWindowResp (Direction B, server side)
-func (s *EdgeSession) sendBodyWithFlowControl(
-	ctx context.Context,
-	stream *muxproto.Stream,
-	body io.Reader,
-	isRequest bool,
-) error {
-	if body == nil {
-		return stream.SendData(nil, muxproto.FlagEndStream)
-	}
-
-	buf := make([]byte, muxproto.DataChunkSize)
-	for {
-		n, readErr := body.Read(buf)
-		if n > 0 {
-			var flags muxproto.Flags
-			if readErr != nil {
-				flags = muxproto.FlagEndStream
-			}
-
-			// Acquire window credit before sending.
-			var acquireErr error
-			if isRequest {
-				acquireErr = stream.AcquireReqWindow(ctx, int64(n))
-			}
-			// (server never sends response body in this flow — that's client side)
-			if acquireErr != nil {
-				return fmt.Errorf("window acquire: %w", acquireErr)
-			}
-
-			if sendErr := stream.SendData(buf[:n], flags); sendErr != nil {
-				return fmt.Errorf("send body DATA: %w", sendErr)
-			}
-		}
-		if readErr != nil {
-			if n == 0 {
-				return stream.SendData(nil, muxproto.FlagEndStream)
-			}
-			return nil // END_STREAM was set on the last chunk above
-		}
-	}
-}
-
 func (s *EdgeSession) removeStream(id uint32) {
 	s.mu.Lock()
 	delete(s.streams, id)
 	s.mu.Unlock()
 }
 
-// streamCleanupReader wraps the response body reader and removes the stream
-// from the session map once the caller finishes consuming the response.
 type streamCleanupReader struct {
 	reader   io.Reader
 	streamID uint32
@@ -243,7 +185,11 @@ func (s *EdgeSession) readLoop() {
 func (s *EdgeSession) handleControlFrame(f *muxproto.Frame) {
 	switch f.Type {
 	case muxproto.TypePong:
-		// handled by pingLoop
+		// Signal pingLoop that a pong was received.
+		select {
+		case s.pongCh <- struct{}{}:
+		default:
+		}
 	case muxproto.TypePing:
 		s.conn.WriteFrame(&muxproto.Frame{Type: muxproto.TypePong}) //nolint:errcheck
 	default:
@@ -268,22 +214,22 @@ func (s *EdgeSession) handleStreamFrame(f *muxproto.Frame) {
 		}
 
 	case muxproto.TypeData:
-		// OnData is non-blocking because flow control ensures the pipe has room.
 		if err := stream.OnData(f); err != nil {
 			s.logger.Warn("stream data error — flow control violation, closing session",
 				"sid", f.StreamID, "err", err)
+			// Send GOAWAY before closing so the client knows why.
+			s.conn.WriteFrame(&muxproto.Frame{ //nolint:errcheck
+				Type:    muxproto.TypeGoAway,
+				Payload: muxproto.Marshal(muxproto.GoAwayMsg{
+					Reason: fmt.Sprintf("flow control violation on stream %d", f.StreamID),
+				}),
+			})
 			s.closeWithReason(fmt.Sprintf("flow control violation on stream %d", f.StreamID))
 		}
 
 	case muxproto.TypeWindowUpdate:
-		// Client consumed bytes from reqBody → credits for Direction A.
-		// Also handles Direction B if client is sending response body.
-		var msg muxproto.WindowUpdateMsg
-		if err := muxproto.Unmarshal(f.Payload, &msg); err != nil {
-			s.logger.Warn("bad WINDOW_UPDATE payload", "sid", f.StreamID, "err", err)
-			return
-		}
-		stream.OnWindowUpdate(msg.Dir, msg.Increment)
+		// Binary-encoded payload: 4(increment) + 1(dir).
+		stream.OnWindowUpdate(f.Payload)
 
 	case muxproto.TypeRST:
 		var msg muxproto.RSTMsg
@@ -293,6 +239,9 @@ func (s *EdgeSession) handleStreamFrame(f *muxproto.Frame) {
 	}
 }
 
+// pingLoop sends periodic PING frames and closes the session if no PONG is
+// received within pingTimeout.
+// FIX: uses pongCh instead of optimistic lastPong — timeout actually works now.
 func (s *EdgeSession) pingLoop() {
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
@@ -302,13 +251,14 @@ func (s *EdgeSession) pingLoop() {
 		select {
 		case <-s.ctx.Done():
 			return
+		case <-s.pongCh:
+			lastPong = time.Now()
 		case <-ticker.C:
 			if time.Since(lastPong) > pingInterval+pingTimeout {
 				s.closeWithReason("ping timeout")
 				return
 			}
 			s.conn.WriteFrame(&muxproto.Frame{Type: muxproto.TypePing}) //nolint:errcheck
-			lastPong = time.Now() // optimistic; replace with pong channel in production
 		}
 	}
 }
