@@ -34,10 +34,19 @@ type Stream struct {
 	closed    chan struct{}
 }
 
+type StreamPhase int32
+
 const (
-	phaseRequest  = 0
-	phaseResponse = 1
-	pipeBufSize   = 512 * 1024 // 512 KiB per direction
+	phaseRequest  StreamPhase = 0
+	phaseResponse StreamPhase = 1
+)
+
+func (StreamPhase) toInt32() int32 {
+	return int32(phaseRequest)
+}
+
+const (
+	pipeBufSize = 512 * 1024 // 512 KiB per direction
 
 	// windowUpdateBatch: minimum bytes consumed before sending WINDOW_UPDATE.
 	windowUpdateBatch = 32 * 1024
@@ -66,8 +75,8 @@ func NewStream(id uint32, conn *MuxConn) *Stream {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type windowTracker struct {
-	mu   sync.Mutex
-	cond *sync.Cond
+	mu    sync.Mutex
+	cond  *sync.Cond
 	avail int64
 }
 
@@ -142,12 +151,16 @@ func isClosed(ch <-chan struct{}) bool {
 	}
 }
 
+func (s *Stream) Phase() StreamPhase {
+	return StreamPhase(s.phase.Load())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Dispatcher methods — called by readLoop (must not block)
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (s *Stream) OnHeaders(f *Frame) error {
-	if s.phase.Load() == phaseRequest {
+	if s.Phase() == phaseRequest {
 		var meta RequestMeta
 		if err := Unmarshal(f.Payload, &meta); err != nil {
 			return fmt.Errorf("parse request headers: %w", err)
@@ -171,9 +184,9 @@ func (s *Stream) OnHeaders(f *Frame) error {
 
 // OnData writes incoming body data into the appropriate pipe (non-blocking).
 func (s *Stream) OnData(f *Frame) error {
-	phase := s.phase.Load()
+	phase := s.Phase()
 	var pipe *StreamPipe
-	if phase == phaseRequest {
+	if s.Phase() == phaseRequest {
 		pipe = s.reqBody
 	} else {
 		pipe = s.respBody
@@ -187,7 +200,7 @@ func (s *Stream) OnData(f *Frame) error {
 	if f.HasFlag(FlagEndStream) {
 		pipe.CloseWrite(nil)
 		if phase == phaseRequest {
-			s.phase.Store(phaseResponse)
+			s.phase.Store(phaseResponse.toInt32())
 		}
 	}
 	return nil

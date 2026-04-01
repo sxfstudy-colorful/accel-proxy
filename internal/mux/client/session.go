@@ -50,10 +50,10 @@ type EdgeClientSession struct {
 	logger     *slog.Logger
 
 	pushStreams map[string]*pushRecvState
-	pushByID   map[uint32]*pushRecvState
-	pushIDMu   sync.RWMutex
+	pushByID    map[uint32]*pushRecvState
+	pushIDMu    sync.RWMutex
 
-	reqStreams   map[uint32]*muxproto.Stream
+	reqStreams  map[uint32]*muxproto.Stream
 	reqStreamMu sync.RWMutex
 
 	conn   *muxproto.MuxConn
@@ -74,15 +74,15 @@ func NewEdgeClientSession(
 ) *EdgeClientSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &EdgeClientSession{
-		nodeID:     nodeID,
-		accessAddr: accessAddr,
-		pushSubs:   pushSubs,
-		reqHandler: reqHandler,
-		logger:     logger.With("node_id", nodeID),
+		nodeID:      nodeID,
+		accessAddr:  accessAddr,
+		pushSubs:    pushSubs,
+		reqHandler:  reqHandler,
+		logger:      logger.With("node_id", nodeID),
 		pushStreams: make(map[string]*pushRecvState, len(pushSubs)),
 		reqStreams:  make(map[uint32]*muxproto.Stream),
-		ctx:        ctx,
-		cancel:     cancel,
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 	for _, name := range pushSubs {
 		s.pushStreams[name] = &pushRecvState{
@@ -413,7 +413,11 @@ func (s *EdgeClientSession) dispatchReqStream(f *muxproto.Frame) {
 
 	switch f.Type {
 	case muxproto.TypeHeaders:
-		stream.OnHeaders(f) //nolint:errcheck
+		if err := stream.OnHeaders(f); err != nil {
+			s.logger.Warn("bad request headers", "sid", f.StreamID, "err", err)
+			_ = stream.SendRST("bad headers")
+			stream.Close()
+		}
 
 	case muxproto.TypeData:
 		if err := stream.OnData(f); err != nil {
@@ -425,7 +429,7 @@ func (s *EdgeClientSession) dispatchReqStream(f *muxproto.Frame) {
 			s.connMu.Unlock()
 			if mc != nil {
 				mc.WriteFrame(&muxproto.Frame{ //nolint:errcheck
-					Type:    muxproto.TypeGoAway,
+					Type: muxproto.TypeGoAway,
 					Payload: muxproto.Marshal(muxproto.GoAwayMsg{
 						Reason: fmt.Sprintf("flow control violation on stream %d", f.StreamID),
 					}),
@@ -453,7 +457,7 @@ func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
 		if r := recover(); r != nil {
 			s.logger.Error("serveRequest panic recovered",
 				"sid", stream.ID, "panic", fmt.Sprintf("%v", r))
-			stream.SendRST("internal error") //nolint:errcheck
+			_ = stream.SendRST("internal error") //nolint:errcheck
 		}
 		s.removeReqStream(stream.ID)
 		stream.Close()
