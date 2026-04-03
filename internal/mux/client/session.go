@@ -96,11 +96,7 @@ func NewEdgeClientSession(
 func (s *EdgeClientSession) Close() {
 	s.closed.Store(true)
 	s.cancel()
-	s.connMu.Lock()
-	if s.conn != nil {
-		s.conn.Close()
-	}
-	s.connMu.Unlock()
+	s.closeConn()
 }
 
 func (s *EdgeClientSession) StreamReader(name string) io.Reader {
@@ -141,6 +137,27 @@ func (s *EdgeClientSession) Run() {
 	}
 }
 
+func (s *EdgeClientSession) getConn() *muxproto.MuxConn {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return s.conn
+}
+
+func (s *EdgeClientSession) setConn(mc *muxproto.MuxConn) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	s.conn = mc
+}
+
+func (s *EdgeClientSession) closeConn() {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.conn != nil {
+		_ = s.conn.Close()
+		s.conn = nil
+	}
+}
+
 func (s *EdgeClientSession) runOnce() error {
 	for _, st := range s.pushStreams {
 		if st.buf.IsClosed() {
@@ -152,19 +169,11 @@ func (s *EdgeClientSession) runOnce() error {
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", s.accessAddr, err)
 	}
-	mc := muxproto.NewMuxConn(conn)
 
-	s.connMu.Lock()
-	s.conn = mc
-	s.connMu.Unlock()
+	s.setConn(muxproto.NewMuxConn(conn))
 
 	defer func() {
-		mc.Close()
-		s.connMu.Lock()
-		if s.conn == mc {
-			s.conn = nil
-		}
-		s.connMu.Unlock()
+		s.closeConn()
 	}()
 
 	// Build capabilities.
@@ -188,7 +197,8 @@ func (s *EdgeClientSession) runOnce() error {
 		PushResume:   resume,
 		Capabilities: caps,
 	})
-	if err := mc.WriteFrame(&muxproto.Frame{
+
+	if err := s.getConn().WriteFrame(&muxproto.Frame{
 		StreamID: muxproto.ControlStreamID,
 		Type:     muxproto.TypeRegister,
 		Payload:  regPayload,
@@ -196,13 +206,15 @@ func (s *EdgeClientSession) runOnce() error {
 		return fmt.Errorf("write REGISTER: %w", err)
 	}
 
-	f, err := mc.ReadFrame()
+	f, err := s.getConn().ReadFrame()
 	if err != nil {
 		return fmt.Errorf("read REGISTER_ACK: %w", err)
 	}
+
 	if f.Type != muxproto.TypeRegisterAck {
 		return fmt.Errorf("expected REGISTER_ACK, got type %d", f.Type)
 	}
+
 	var ack muxproto.RegisterAckMsg
 	if err := muxproto.Unmarshal(f.Payload, &ack); err != nil || !ack.OK {
 		return fmt.Errorf("registration rejected: %s", ack.Message)
@@ -215,6 +227,7 @@ func (s *EdgeClientSession) runOnce() error {
 			byID[id] = st
 		}
 	}
+
 	s.pushIDMu.Lock()
 	s.pushByID = byID
 	s.pushIDMu.Unlock()
@@ -223,27 +236,25 @@ func (s *EdgeClientSession) runOnce() error {
 
 	ackStop := make(chan struct{})
 	if len(s.pushSubs) > 0 {
-		go s.ackLoop(mc, ackStop)
+		go s.ackLoop(ackStop)
 	}
 	defer close(ackStop)
 
 	pongCh := make(chan struct{}, 4)
 	s.pongCh = pongCh
 	pingStop := make(chan struct{})
-	go s.pingLoop(mc, pingStop, pongCh)
+	go s.pingLoop(pingStop, pongCh)
 	defer close(pingStop)
 
-	return s.readLoop(mc)
+	return s.dispatchLoop()
 }
 
-// ─── Frame dispatch ──────────────────────────────────────────────────────────
-
-func (s *EdgeClientSession) readLoop(mc *muxproto.MuxConn) error {
+func (s *EdgeClientSession) dispatchLoop() error {
 	for {
 		if s.ctx.Err() != nil {
 			return nil
 		}
-		f, err := mc.ReadFrame()
+		f, err := s.getConn().ReadFrame()
 		if err != nil {
 			if s.ctx.Err() != nil {
 				return nil
@@ -253,20 +264,26 @@ func (s *EdgeClientSession) readLoop(mc *muxproto.MuxConn) error {
 
 		switch {
 		case f.StreamID == muxproto.ControlStreamID:
-			// FIX: pass mc directly — readLoop already has it, no need to lock connMu.
-			s.handleControl(mc, f)
+			if err := s.handleControl(f); err != nil {
+				return fmt.Errorf("handle control: %w", err)
+			}
 
 		case f.Type == muxproto.TypePushData:
 			s.handlePushData(f)
+
 		case f.Type == muxproto.TypePushRST:
 			s.handlePushRST(f)
 
 		case f.Type == muxproto.TypeHeaders && !s.hasReqStream(f.StreamID):
-			s.handleNewRequest(mc, f)
+			if err := s.handleNewRequest(f); err != nil {
+				return fmt.Errorf("handle new request: %w", err)
+			}
 
 		case f.Type == muxproto.TypeHeaders || f.Type == muxproto.TypeData ||
 			f.Type == muxproto.TypeRST || f.Type == muxproto.TypeWindowUpdate:
-			s.dispatchReqStream(f)
+			if err := s.dispatchReqStream(f); err != nil {
+				return fmt.Errorf("dispatch req stream: %w", err)
+			}
 
 		default:
 			s.logger.Debug("unhandled frame", "type", f.Type, "sid", f.StreamID)
@@ -274,21 +291,31 @@ func (s *EdgeClientSession) readLoop(mc *muxproto.MuxConn) error {
 	}
 }
 
-// FIX: takes mc parameter directly instead of locking connMu.
-func (s *EdgeClientSession) handleControl(mc *muxproto.MuxConn, f *muxproto.Frame) {
+func (s *EdgeClientSession) handleControl(f *muxproto.Frame) error {
 	switch f.Type {
 	case muxproto.TypePing:
-		mc.WriteFrame(&muxproto.Frame{Type: muxproto.TypePong}) //nolint:errcheck
+		if err := s.getConn().WriteFrame(&muxproto.Frame{Type: muxproto.TypePong}); err != nil {
+			s.logger.Error("ping error", "err", err)
+			return fmt.Errorf("ping error: %w", err)
+		}
+
 	case muxproto.TypePong:
 		select {
 		case s.pongCh <- struct{}{}:
 		default:
 		}
+
 	case muxproto.TypeGoAway:
 		var msg muxproto.GoAwayMsg
-		muxproto.Unmarshal(f.Payload, &msg) //nolint:errcheck
+		if err := muxproto.Unmarshal(f.Payload, &msg); err != nil {
+			s.logger.Error("goaway error", "err", err)
+			return fmt.Errorf("goaway error: %w", err)
+		}
+
 		s.logger.Info("received GOAWAY", "reason", msg.Reason)
 	}
+
+	return nil
 }
 
 // ─── Push stream handling ────────────────────────────────────────────────────
@@ -346,7 +373,7 @@ func (s *EdgeClientSession) sendPushAck(st *pushRecvState) {
 	st.ackedOffset.Store(offset)
 }
 
-func (s *EdgeClientSession) ackLoop(mc *muxproto.MuxConn, stop <-chan struct{}) {
+func (s *EdgeClientSession) ackLoop(stop <-chan struct{}) {
 	ticker := time.NewTicker(ackInterval)
 	defer ticker.Stop()
 	for {
@@ -367,8 +394,6 @@ func (s *EdgeClientSession) ackLoop(mc *muxproto.MuxConn, stop <-chan struct{}) 
 	}
 }
 
-// ─── Request-response stream handling ────────────────────────────────────────
-
 func (s *EdgeClientSession) hasReqStream(id uint32) bool {
 	s.reqStreamMu.RLock()
 	_, ok := s.reqStreams[id]
@@ -376,39 +401,19 @@ func (s *EdgeClientSession) hasReqStream(id uint32) bool {
 	return ok
 }
 
-func (s *EdgeClientSession) handleNewRequest(mc *muxproto.MuxConn, f *muxproto.Frame) {
-	if s.reqHandler == nil {
-		s.logger.Warn("received request but no handler", "sid", f.StreamID)
-		mc.WriteFrame(&muxproto.Frame{ //nolint:errcheck
-			StreamID: f.StreamID,
-			Type:     muxproto.TypeRST,
-			Payload:  muxproto.Marshal(muxproto.RSTMsg{Reason: "no handler"}),
-		})
-		return
-	}
-
-	stream := muxproto.NewStream(f.StreamID, mc)
+func (s *EdgeClientSession) removeReqStream(id uint32) {
 	s.reqStreamMu.Lock()
-	s.reqStreams[f.StreamID] = stream
+	delete(s.reqStreams, id)
 	s.reqStreamMu.Unlock()
-
-	if err := stream.OnHeaders(f); err != nil {
-		s.logger.Warn("bad request headers", "sid", f.StreamID, "err", err)
-		stream.SendRST("bad headers") //nolint:errcheck
-		s.removeReqStream(f.StreamID)
-		return
-	}
-
-	go s.serveRequest(stream)
 }
 
-func (s *EdgeClientSession) dispatchReqStream(f *muxproto.Frame) {
+func (s *EdgeClientSession) dispatchReqStream(f *muxproto.Frame) error {
 	s.reqStreamMu.RLock()
 	stream := s.reqStreams[f.StreamID]
 	s.reqStreamMu.RUnlock()
 	if stream == nil {
-		s.logger.Warn("frame for unknown req stream", "sid", f.StreamID)
-		return
+		s.logger.Warn("frame for unknown req stream, ignore this condition", "sid", f.StreamID)
+		return nil
 	}
 
 	switch f.Type {
@@ -423,92 +428,38 @@ func (s *EdgeClientSession) dispatchReqStream(f *muxproto.Frame) {
 		if err := stream.OnData(f); err != nil {
 			s.logger.Warn("stream data error — flow control violation",
 				"sid", f.StreamID, "err", err)
-			// FIX: send GOAWAY before closing so server knows why.
-			s.connMu.Lock()
-			mc := s.conn
-			s.connMu.Unlock()
+			mc := s.getConn()
 			if mc != nil {
-				mc.WriteFrame(&muxproto.Frame{ //nolint:errcheck
+				if err := mc.WriteFrame(&muxproto.Frame{ //nolint:errcheck
 					Type: muxproto.TypeGoAway,
 					Payload: muxproto.Marshal(muxproto.GoAwayMsg{
 						Reason: fmt.Sprintf("flow control violation on stream %d", f.StreamID),
 					}),
-				})
-				mc.Close()
+				}); err != nil {
+					s.logger.Warn("flow control violation", "sid", f.StreamID, "err", err)
+					return fmt.Errorf("flow control violation on stream %d", f.StreamID)
+				}
 			}
 		}
 
 	case muxproto.TypeWindowUpdate:
-		// Binary-encoded payload: 4(increment) + 1(dir).
 		stream.OnWindowUpdate(f.Payload)
 
 	case muxproto.TypeRST:
 		var msg muxproto.RSTMsg
-		muxproto.Unmarshal(f.Payload, &msg) //nolint:errcheck
+		if err := muxproto.Unmarshal(f.Payload, &msg); err != nil {
+			s.logger.Warn("bad request rst", "sid", f.StreamID, "err", err)
+		}
 		stream.OnRST(msg.Reason)
 		s.removeReqStream(f.StreamID)
 	}
-}
 
-// serveRequest handles one server-pushed HTTP request.
-// FIX: panic recovery to prevent handler panics from leaking streams.
-func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
-	defer func() {
-		if r := recover(); r != nil {
-			s.logger.Error("serveRequest panic recovered",
-				"sid", stream.ID, "panic", fmt.Sprintf("%v", r))
-			_ = stream.SendRST("internal error") //nolint:errcheck
-		}
-		s.removeReqStream(stream.ID)
-		stream.Close()
-	}()
-
-	reqMeta, err := stream.RecvRequestHeaders()
-	if err != nil {
-		s.logger.Warn("recv request headers failed", "sid", stream.ID, "err", err)
-		return
-	}
-
-	s.logger.Info("reverse request",
-		"sid", stream.ID, "method", reqMeta.Method,
-		"url", reqMeta.URL, "host", reqMeta.Host)
-
-	// ReqBodyReader auto-sends WINDOW_UPDATE(WinDirRequest) as handler reads.
-	respMeta, respBody, err := s.reqHandler(s.ctx, reqMeta, stream.ReqBodyReader())
-	if err != nil {
-		s.logger.Error("handler error", "sid", stream.ID, "err", err)
-		stream.SendRST(fmt.Sprintf("handler error: %v", err)) //nolint:errcheck
-		return
-	}
-
-	if err := stream.SendHeaders(respMeta, 0); err != nil {
-		s.logger.Error("send resp headers", "sid", stream.ID, "err", err)
-		return
-	}
-
-	// Send response body with flow control (Direction B).
-	if respBody != nil {
-		if closer, ok := respBody.(io.Closer); ok {
-			defer closer.Close()
-		}
-		if err := stream.SendBodyWithFlowControl(s.ctx, respBody, muxproto.WinDirResponse); err != nil {
-			s.logger.Error("send resp body", "sid", stream.ID, "err", err)
-			return
-		}
-	} else {
-		stream.SendData(nil, muxproto.FlagEndStream) //nolint:errcheck
-	}
-}
-
-func (s *EdgeClientSession) removeReqStream(id uint32) {
-	s.reqStreamMu.Lock()
-	delete(s.reqStreams, id)
-	s.reqStreamMu.Unlock()
+	return nil
 }
 
 // ─── Keepalive ───────────────────────────────────────────────────────────────
 
-func (s *EdgeClientSession) pingLoop(mc *muxproto.MuxConn, stop <-chan struct{}, pongCh <-chan struct{}) {
+func (s *EdgeClientSession) pingLoop(stop <-chan struct{}, pongCh <-chan struct{}) {
 	ticker := time.NewTicker(clientPingInterval)
 	defer ticker.Stop()
 	lastPong := time.Now()
@@ -523,11 +474,14 @@ func (s *EdgeClientSession) pingLoop(mc *muxproto.MuxConn, stop <-chan struct{},
 			lastPong = time.Now()
 		case <-ticker.C:
 			if time.Since(lastPong) > clientPingInterval+clientPingTimeout {
-				s.logger.Warn("ping timeout")
-				mc.Close()
+				s.logger.Error("ping timeout")
+				s.closeConn()
 				return
 			}
-			mc.WriteFrame(&muxproto.Frame{Type: muxproto.TypePing}) //nolint:errcheck
+
+			if err := s.getConn().WriteFrame(&muxproto.Frame{Type: muxproto.TypePing}); err != nil {
+				s.logger.Error("write frame err %+v", err.Error())
+			}
 		}
 	}
 }
