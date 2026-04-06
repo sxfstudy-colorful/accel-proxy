@@ -38,8 +38,6 @@ func (s *EdgeClientSession) handleNewRequest(f *muxproto.Frame) error {
 	return nil
 }
 
-// serveRequest handles one server-pushed HTTP request.
-// FIX: panic recovery to prevent handler panics from leaking streams.
 func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -53,7 +51,7 @@ func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
 
 	reqMeta, err := stream.RecvRequestHeaders()
 	if err != nil {
-		s.logger.Warn("recv request headers failed", "sid", stream.ID, "err", err)
+		s.logger.Warn("receive request headers failed", "sid", stream.ID, "err", err)
 		return
 	}
 
@@ -61,11 +59,10 @@ func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
 		"sid", stream.ID, "method", reqMeta.Method,
 		"url", reqMeta.URL, "host", reqMeta.Host)
 
-	// ReqBodyReader auto-sends WINDOW_UPDATE(WinDirRequest) as handler reads.
 	respMeta, respBody, err := s.reqHandler(s.ctx, reqMeta, stream.ReqBodyReader())
 	if err != nil {
 		s.logger.Error("handler error", "sid", stream.ID, "err", err)
-		stream.SendRST(fmt.Sprintf("handler error: %v", err)) //nolint:errcheck
+		_ = stream.SendRST(fmt.Sprintf("handler error: %v", err))
 		return
 	}
 
@@ -74,16 +71,19 @@ func (s *EdgeClientSession) serveRequest(stream *muxproto.Stream) {
 		return
 	}
 
-	// Send response body with flow control (Direction B).
 	if respBody != nil {
 		if closer, ok := respBody.(io.Closer); ok {
-			defer closer.Close()
+			defer func() {
+				_ = closer.Close()
+			}()
 		}
+
 		if err := stream.SendBodyWithFlowControl(s.ctx, respBody, muxproto.WinDirResponse); err != nil {
 			s.logger.Error("send resp body", "sid", stream.ID, "err", err)
+			_ = stream.SendRST(fmt.Sprintf("send data error: %v", err))
 			return
 		}
 	} else {
-		stream.SendData(nil, muxproto.FlagEndStream) //nolint:errcheck
+		_ = stream.SendData(nil, muxproto.FlagEndStream)
 	}
 }

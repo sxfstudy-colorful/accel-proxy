@@ -430,7 +430,7 @@ func (s *EdgeClientSession) dispatchReqStream(f *muxproto.Frame) error {
 				"sid", f.StreamID, "err", err)
 			mc := s.getConn()
 			if mc != nil {
-				if err := mc.WriteFrame(&muxproto.Frame{ //nolint:errcheck
+				if err := mc.WriteFrame(&muxproto.Frame{
 					Type: muxproto.TypeGoAway,
 					Payload: muxproto.Marshal(muxproto.GoAwayMsg{
 						Reason: fmt.Sprintf("flow control violation on stream %d", f.StreamID),

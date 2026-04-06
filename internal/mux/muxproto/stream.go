@@ -313,17 +313,13 @@ func (s *Stream) SendBodyWithFlowControl(ctx context.Context, body io.Reader, di
 		n, readErr := body.Read(buf)
 		if n > 0 {
 			var flags Flags
-			if readErr != nil {
-				flags = FlagEndStream
-			}
-
-			// Acquire window credit before sending.
 			var acquireErr error
 			if dir == WinDirRequest {
 				acquireErr = s.AcquireReqWindow(ctx, int64(n))
 			} else {
 				acquireErr = s.AcquireRespWindow(ctx, int64(n))
 			}
+
 			if acquireErr != nil {
 				return fmt.Errorf("window acquire: %w", acquireErr)
 			}
@@ -332,11 +328,11 @@ func (s *Stream) SendBodyWithFlowControl(ctx context.Context, body io.Reader, di
 				return fmt.Errorf("send body DATA: %w", sendErr)
 			}
 		}
-		if readErr != nil {
-			if n == 0 {
-				return s.SendData(nil, FlagEndStream)
-			}
-			return nil
+
+		if readErr == io.EOF {
+			return s.SendData(nil, FlagEndStream)
+		} else if readErr != nil {
+			return readErr
 		}
 	}
 }
